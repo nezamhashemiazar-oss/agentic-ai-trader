@@ -606,6 +606,35 @@ class TraderEngine:
         ])
 
     # ================================================================ command router
+    # Prefixes that unambiguously start an engine command. Used by the CLI to
+    # decide whether a bare line is engine syntax or free text for the model.
+    COMMAND_PREFIXES: tuple[str, ...] = (
+        "start trading", "stop trading", "autotrade", "engine on", "engine off",
+        "status", "report ", "trades_history", "trades history", "tpsl_history",
+        "tpsl history", "pnl", "p&l", "settings", "scan on", "scan off",
+        "mid management", "reversal", "scans interval", "breakeven threshold",
+        "trailing trigger", "liq sl distance", "min agreeing", "timeframes",
+        "min confidence", "tf min confidence", "positions history", "close position",
+        "margin mode", "position mode", "symbols", "symbol ", "max open positions",
+        "leverage", "risk ",
+    )
+
+    def looks_like_command(self, line: str) -> bool:
+        """True only if the line matches engine command grammar.
+
+        Deliberately strict: a natural-language sentence must NOT be swallowed
+        by the engine and answered with "Unknown engine command".
+        """
+        low = line.strip().lower()
+        if not low:
+            return False
+        if low in ("status", "pnl", "p&l", "trades_history", "tpsl_history",
+                   "trades history", "tpsl history", "engine on", "engine off",
+                   "start trading", "stop trading", "scan on", "scan off",
+                   "report on", "report off", "settings", "settings trade"):
+            return True
+        return any(low.startswith(p) for p in self.COMMAND_PREFIXES)
+
     async def command(self, line: str) -> str:
         """Route an engine command. Returns a human-readable result."""
         raw = line.strip()

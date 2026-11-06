@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 
 from .agent import HELP, JRockAgent
@@ -24,16 +25,18 @@ async def run_once(agent: JRockAgent, line: str) -> None:
 
 async def interactive(agent: JRockAgent) -> None:
     print(await agent.startup())
-    print("\nType /help for commands. Ctrl-D to exit.\n")
+    print("\nType help or /help for commands. Ctrl-D to exit.\n")
     while True:
         try:
             line = await asyncio.to_thread(input, "j+rock> ")
         except (EOFError, KeyboardInterrupt):
             print("\nbye")
             break
-        if line.strip() in ("exit", "quit", "/exit", "/quit"):
+        stripped = line.strip()
+        if stripped.lower() in ("exit", "quit", "/exit", "/quit", ":q"):
+            print("bye")
             break
-        if not line.strip():
+        if not stripped:
             continue
         await run_once(agent, line)
     await agent.engine.stop()
@@ -45,7 +48,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--startup", action="store_true", help="run startup checks and exit")
     ap.add_argument("--env", help="path to .env")
     ap.add_argument("--help-cmds", action="store_true", help="print the command list")
+    ap.add_argument("--free-only", action="store_true",
+                    help="restrict AutoSetModelByKey probing to free models (same as FREE_ONLY=true)")
     args = ap.parse_args(argv)
+
+    if args.free_only:
+        os.environ["FREE_ONLY"] = "true"
 
     if args.help_cmds:
         print(HELP)

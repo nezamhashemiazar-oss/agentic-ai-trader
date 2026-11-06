@@ -27,9 +27,12 @@ SOUL_PATH = ROOT / "soul" / "jrock.soul.md"
 
 HELP = """J+Rock commands
 ================
-AGENT
-  /help                     this list
-  /models                   list models available on BASE_URL with API_KEY
+Type /help or help or ? for this list.
+Anything that is not a command is sent to the model as natural language.
+
+AGENT COMMANDS
+  /help  help  ?            this list
+  /models [--free]          list models on BASE_URL; --free shows only free ones
   /set_model <name>         pin a model (writes MODEL= to .env)
   /connect_provider <url> <key>   set BASE_URL + API_KEY, then auto-probe
   /add_mcp <name> <cmd>     register an MCP server (stdio command)
@@ -50,7 +53,7 @@ AGENT
   /autopsy <error|file>     root-cause analysis of a failure
   /diagnose                 full diagnostic bundle
 
-TRADER ENGINE
+TRADER ENGINE COMMANDS
   start trading | autotrade on      stop trading | autotrade off
   engine on | engine off            status
   report on | report off            report interval sec 30
@@ -71,7 +74,27 @@ PERMISSIONS
   audit                      show the audit log
   pending                    show edits waiting for approval
   approve [n]                approve a pending edit
+
+FREE TEXT
+  anything else (e.g. "switch to free model", "why did my order fail?")
+  goes to the model. exit / quit / Ctrl-D leave the REPL.
 """
+
+# Bare words that mean an agent command (no leading slash needed).
+AGENT_BARE: dict[str, str] = {
+    "help": "/help", "?": "/help", "models": "/models", "model": "/models",
+    "soul": "/soul", "memory": "/memory", "think": "/think",
+    "verify": "/verify", "diagnose": "/diagnose", "autopsy": "/autopsy",
+    "mcp": "/mcp", "skill": "/skill", "skills": "/skill",
+    "check_ai": "/check_ai", "check_system": "/check_system",
+    "code_review": "/code_review", "bug_fix": "/bug_fix", "simplify": "/simplify",
+}
+
+# Natural-language intents we handle deterministically instead of guessing.
+FREE_MODEL_INTENT = re.compile(
+    r"\b(switch|use|pick|select|set|go|change)\b.*\bfree\b.*\bmodel\b"
+    r"|\bfree\b.*\bmodel\b.*\b(only|please|now)\b"
+    r"|\buse\s+(a\s+)?free\s+model\b", re.I)
 
 
 @dataclass
@@ -276,16 +299,16 @@ class JRockAgent:
             return f"approved {item['path']} - re-run the edit to apply it"
 
         if not low.startswith("/"):
-            return await self.engine.command(raw)
+            return await self.route_bare(raw)
 
         cmd, _, rest = raw.partition(" ")
         cmd = cmd.lower()
         rest = rest.strip()
 
-        if cmd == "/help":
+        if cmd in ("/help", "/?"):
             return HELP
         if cmd == "/models":
-            return await self.cmd_models()
+            return await self.cmd_models(rest)
         if cmd == "/set_model":
             return self.cmd_set_model(rest)
         if cmd == "/connect_provider":
@@ -293,11 +316,15 @@ class JRockAgent:
         if cmd == "/add_mcp":
             return self.cmd_add_mcp(rest)
         if cmd == "/mcp":
-            return json.dumps(self.mcp_servers, indent=2) or "no MCP servers registered"
+            if not self.mcp_servers:
+                return "no MCP servers registered (use /add_mcp <name> <cmd>)"
+            return json.dumps(self.mcp_servers, indent=2)
         if cmd == "/add_skill":
             return self.cmd_add_skill(rest)
         if cmd == "/skill":
-            return json.dumps(self.skills, indent=2) or "no skills registered"
+            if not self.skills:
+                return "no skills registered (use /add_skill <name> <path>)"
+            return json.dumps(self.skills, indent=2)
         if cmd == "/add_soul":
             return self.cmd_add_soul(rest)
         if cmd == "/soul":
@@ -327,21 +354,129 @@ class JRockAgent:
 
         return f"Unknown command {cmd}. Try /help"
 
-    async def cmd_models(self) -> str:
-        from .model_selector import list_models, score_model
+    # ------------------------------------------------------------ routing
+    async def route_bare(self, raw: str) -> str:
+        """Route a line with no leading slash.
+
+        Order:
+          1. bare word that names an agent command  -> agent dispatcher
+          2. known natural-language intent          -> handled deterministically
+          3. engine command grammar                 -> engine
+          4. anything else                          -> the model
+        """
+        low = raw.strip().lower()
+        head = low.split()[0] if low.split() else ""
+
+        # 1) bare agent command name
+        if head in AGENT_BARE:
+            mapped = AGENT_BARE[head]
+            rest = raw.strip()[len(head):].strip()
+            return await self.handle(f"{mapped} {rest}".strip())
+
+        # 2) natural-language intents we can act on without the model
+        if FREE_MODEL_INTENT.search(raw):
+            return await self.cmd_use_free_model()
+
+        # 3) engine grammar
+        if self.engine.looks_like_command(raw):
+            return await self.engine.command(raw)
+
+        # 4) free text -> the model
+        return await self.chat(raw)
+
+    async def cmd_use_free_model(self) -> str:
+        """Act on "switch to free model": probe free models only and pin one."""
+        from .model_selector import autoset_model
+        if not self.s.api_key:
+            return ("Cannot switch models: API_KEY is empty in .env.\n"
+                    "Set API_KEY and BASE_URL, then run /models --free.")
+        res = await autoset_model(self.s.base_url, self.s.api_key, free_only=True)
+        if res.ok and res.selected:
+            self.model = res.selected
+            persist_model(ROOT / ".env", res.selected)
+            self.memory.fact("model", res.selected)
+            return (f"Switched to free model {res.selected} (written to .env).\n"
+                    f"{res.message}")
+        return ("No free model worked with this key.\n" + res.message)
+
+    async def chat(self, text: str) -> str:
+        """Send free text to the configured model."""
+        from .model_selector import autoset_model
+        import aiohttp
+
+        if not self.s.api_key:
+            return (f"I could not send that to a model: API_KEY is empty in .env.\n"
+                    f"You said: {text!r}\n"
+                    f"Set API_KEY + BASE_URL, or use a command (type help).")
+
+        model = self.model or self.s.model
+        if not model:
+            res = await autoset_model(self.s.base_url, self.s.api_key)
+            if not res.ok:
+                return (f"I could not reach a model.\n{res.message}\n\n"
+                        f"You said: {text!r}")
+            model = res.selected
+            self.model = model
+
+        system = ("You are J+Rock, an agentic coding and trading-systems engineer. "
+                  "Be direct, never fabricate results, say 'I don't know' when unsure. "
+                  "You have a Bitunix futures engine; its commands are listed in /help.")
+        payload = {
+            "model": model,
+            "messages": [{"role": "system", "content": system},
+                         {"role": "user", "content": text}],
+            "max_tokens": 800,
+            "temperature": 0.2,
+        }
+        url = f"{self.s.base_url.rstrip('/')}/chat/completions"
+        try:
+            async with aiohttp.ClientSession() as sess:
+                async with sess.post(
+                    url,
+                    headers={"Authorization": f"Bearer {self.s.api_key}",
+                             "Content-Type": "application/json"},
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=90),
+                ) as r:
+                    body = await r.text()
+                    if r.status != 200:
+                        return (f"Model call failed: HTTP {r.status}: {body[:400]}\n"
+                                f"You said: {text!r}")
+                    d = json.loads(body)
+        except Exception as e:  # noqa: BLE001
+            return f"Model call failed: {type(e).__name__}: {e}"
+
+        choices = d.get("choices") or []
+        if not choices:
+            return f"Model returned no choices: {body[:300]}"
+        msg = choices[0].get("message") or {}
+        out = (msg.get("content") or "").strip()
+        self.memory.episode("chat", text[:120], out[:120], ok=True)
+        return out or "(model returned an empty message)"
+
+    async def cmd_models(self, rest: str = "") -> str:
+        from .model_selector import list_model_info
         import aiohttp
         if not self.s.api_key:
             return "API_KEY is empty in .env"
+        free_only = "--free" in rest or "free" in rest.split()
         try:
             async with aiohttp.ClientSession() as sess:
-                models = await list_models(sess, self.s.base_url, self.s.api_key)
+                infos = await list_model_info(sess, self.s.base_url, self.s.api_key)
         except Exception as e:  # noqa: BLE001
             return f"failed: {e}"
-        ranked = sorted(models, key=score_model, reverse=True)
-        lines = [f"{len(models)} models on {self.s.base_url} (best first):"]
-        for m in ranked[:40]:
-            mark = " *" if m == self.model else ""
-            lines.append(f"  {score_model(m):5.0f}  {m}{mark}")
+        if free_only:
+            infos = [m for m in infos if m.free]
+        infos.sort(key=lambda m: m.score, reverse=True)
+        n_free = sum(1 for m in infos if m.free)
+        lines = [f"{len(infos)} models on {self.s.base_url} "
+                 f"({n_free} free){' - free only' if free_only else ''}:"]
+        for m in infos[:40]:
+            mark = " *" if m.id == self.model else ""
+            tag = "free" if m.free else "paid"
+            lines.append(f"  {m.score:5.0f}  {tag:4}  {m.id}{mark}")
+        if not infos:
+            lines.append("  (none)")
         return "\n".join(lines)
 
     def cmd_set_model(self, name: str) -> str:

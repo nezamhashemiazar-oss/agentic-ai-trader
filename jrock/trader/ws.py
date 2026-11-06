@@ -6,9 +6,12 @@ Public channels (wss://fapi.bitunix.com/public/):
 Private channels (wss://fapi.bitunix.com/private/):
     balance, order, position, tpsl
 
-Login signature (official):
-    sign = sha256(sha256(timestamp + nonce + apiKey) + secretKey)
+Login signature (official, docs/bitunix/WebSocket.md):
+    sign = sha256(sha256(nonce + timestamp + apiKey) + secretKey)
     (same double-SHA256 scheme as REST, with timestamp in SECONDS)
+
+NOTE the order is nonce THEN timestamp - the same order as REST. An earlier
+version of this file had timestamp first, which the exchange rejects.
 """
 from __future__ import annotations
 
@@ -51,7 +54,11 @@ def _nonce(n: int = 32) -> str:
 
 
 def ws_login_sign(api_key: str, secret: str, timestamp: int, nonce: str) -> str:
-    digest = hashlib.sha256(f"{timestamp}{nonce}{api_key}".encode()).hexdigest()
+    """sign = sha256(sha256(nonce + timestamp + apiKey) + secret).
+
+    Order is nonce, then timestamp - per docs/bitunix/WebSocket.md line 226.
+    """
+    digest = hashlib.sha256(f"{nonce}{timestamp}{api_key}".encode()).hexdigest()
     return hashlib.sha256((digest + secret).encode()).hexdigest()
 
 

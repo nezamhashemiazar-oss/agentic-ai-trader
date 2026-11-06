@@ -1,9 +1,20 @@
 """Bitunix USDT-M futures REST client.
 
-Signature (official):
+Signature (official, verified against the demo repo's test vector):
     message = nonce + timestamp + apiKey + queryString + body
     digest  = sha256(message)
     sign    = sha256(digest + secretKey)
+
+CRITICAL: `queryString` in the signature is NOT the URL query string.
+The official demo (Demo/Golang/open_api_http_sign.go -> SortParams, and
+Demo/Java/.../SignUtils.java) concatenates sorted key+value pairs with NO
+separator and NO '=':
+
+    params {marginCoin: USDT}  ->  signed as "marginCoinUSDT"
+    but the URL sent is          "?marginCoin=USDT"
+
+Signing the urlencoded form is the #1 cause of error 10007. The official
+test vector is asserted in tests/test_signing.py.
 
 Headers: api-key, sign, nonce, timestamp, language, Content-Type.
 Response envelope: {"code": 0, "data": ..., "msg": "Success"}  (code != 0 => error)
@@ -15,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import random
 import string
 import time
@@ -29,6 +41,31 @@ from .errors import BitunixAPIError, describe
 
 def _nonce(n: int = 32) -> str:
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
+
+
+def sign_query_string(params: dict[str, Any] | None) -> str:
+    """Build the string that goes INTO the signature.
+
+    Official demo behaviour: sorted keys, then key+value concatenated with no
+    '=' and no '&'. Empty values are skipped entirely (SignUtils.java).
+    """
+    if not params:
+        return ""
+    parts = []
+    for k in sorted(params):
+        v = params[k]
+        if v is None or v == "":
+            continue
+        parts.append(f"{k}{v}")
+    return "".join(parts)
+
+
+def url_query_string(params: dict[str, Any] | None) -> str:
+    """Build the string that goes into the URL (normal urlencoded form)."""
+    if not params:
+        return ""
+    clean = {k: v for k, v in params.items() if v is not None and v != ""}
+    return urlencode(sorted(clean.items())) if clean else ""
 
 
 @dataclass
@@ -48,6 +85,9 @@ class BitunixClient:
         self.cfg = cfg
         self._session: aiohttp.ClientSession | None = None
         self._time_offset_ms: int = 0
+        self.debug_sign: bool = os.getenv("BITUNIX_DEBUG_SIGN", "").strip().lower() in (
+            "1", "true", "yes", "on")
+        self.last_sign_debug: dict[str, str] = {}
 
     async def __aenter__(self) -> "BitunixClient":
         await self.start()
@@ -68,9 +108,27 @@ class BitunixClient:
 
     # ------------------------------------------------------------------ signing
     def sign(self, nonce: str, timestamp: str, query: str = "", body: str = "") -> str:
+        """sign = sha256(sha256(nonce+ts+apiKey+query+body) + secret).
+
+        `query` here is the SIGNING form (key+value, no '='), not the URL form.
+        """
         message = f"{nonce}{timestamp}{self.cfg.api_key}{query}{body}"
         digest = hashlib.sha256(message.encode()).hexdigest()
-        return hashlib.sha256((digest + self.cfg.api_secret).encode()).hexdigest()
+        sign = hashlib.sha256((digest + self.cfg.api_secret).encode()).hexdigest()
+        if self.debug_sign:
+            self.last_sign_debug = {
+                "preimage": message,
+                "digest": digest,
+                "sign": sign,
+                "query_signed": query,
+                "body_signed": body,
+            }
+            # Spec: print the exact pre-image and the resulting signature so the
+            # user can diff them against the official demo repo.
+            print("[BITUNIX_DEBUG_SIGN] preimage = " + message)
+            print("[BITUNIX_DEBUG_SIGN] digest   = " + digest)
+            print("[BITUNIX_DEBUG_SIGN] sign     = " + sign)
+        return sign
 
     def _headers(self, nonce: str, timestamp: str, sign: str) -> dict[str, str]:
         return {
@@ -90,10 +148,12 @@ class BitunixClient:
         await self.start()
         assert self._session is not None
 
-        params = {k: v for k, v in (params or {}).items() if v is not None}
-        query = urlencode(sorted(params.items())) if params else ""
+        params = {k: v for k, v in (params or {}).items() if v is not None and v != ""}
+        # Two DIFFERENT strings: one for the URL, one for the signature.
+        url_query = url_query_string(params)
+        sign_query = sign_query_string(params)
         body_str = json.dumps(body, separators=(",", ":"), sort_keys=True) if body else ""
-        url = f"{self.cfg.base_url}{path}" + (f"?{query}" if query else "")
+        url = f"{self.cfg.base_url}{path}" + (f"?{url_query}" if url_query else "")
 
         headers: dict[str, str] = {"Content-Type": "application/json", "language": self.cfg.language}
         if signed:
@@ -101,7 +161,7 @@ class BitunixClient:
                 raise BitunixAPIError(10003, "api-key can't be empty (set BITUNIX_API_KEY / BITUNIX_API_SECRET)")
             ts = str(int(time.time() * 1000) + self._time_offset_ms)
             nonce = _nonce()
-            headers = self._headers(nonce, ts, self.sign(nonce, ts, query, body_str))
+            headers = self._headers(nonce, ts, self.sign(nonce, ts, sign_query, body_str))
 
         last_err: Exception | None = None
         for attempt in range(self.cfg.max_retries):
@@ -126,7 +186,8 @@ class BitunixClient:
                             await self.sync_time()
                             ts = str(int(time.time() * 1000) + self._time_offset_ms)
                             nonce = _nonce()
-                            headers = self._headers(nonce, ts, self.sign(nonce, ts, query, body_str))
+                            headers = self._headers(
+                                nonce, ts, self.sign(nonce, ts, sign_query, body_str))
                             continue
                         raise BitunixAPIError(code, payload.get("msg", ""), payload.get("data"))
                     return payload.get("data")
