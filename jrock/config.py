@@ -66,6 +66,10 @@ class Settings:
     scan_interval: int = 30
     report_interval: int = 30
     thinking_level: str = "medium"
+    # rest | ws. Defaults to rest: the public WS layer is live-verified, but the
+    # private (position/order/balance) login handshake has never been verified
+    # against the real server, so we do not silently switch the engine onto it.
+    market_data_source: str = "rest"
 
     @property
     def data_dir(self) -> Path:
@@ -112,4 +116,14 @@ def load_settings(env_file: str | os.PathLike | None = None) -> Settings:
         scan_interval=_i("TRADE_SCAN_INTERVAL", 30),
         report_interval=_i("TRADE_REPORT_INTERVAL", 30),
         thinking_level=level_from_env(),
+        market_data_source=_market_data_source(),
     )
+
+
+def _market_data_source() -> str:
+    """MARKET_DATA_SOURCE=rest|ws, default rest.
+
+    Anything unrecognised falls back to rest rather than guessing.
+    """
+    v = (os.getenv("MARKET_DATA_SOURCE") or "rest").strip().lower()
+    return v if v in ("rest", "ws") else "rest"

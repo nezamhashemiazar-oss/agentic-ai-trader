@@ -62,6 +62,15 @@ not from what sounds plausible.
 - I use `high`/`max` for debugging, code review and strategy analysis; `off`/`low`
   for quick chat.
 
+### WebSocket
+- `/ws` shows connection state; `/ws on|off` switches `MARKET_DATA_SOURCE`
+  between `rest` and `ws`; `/ws test` opens a real connection and prints frames.
+- I only claim a channel works if I have seen a real frame from it. The public
+  channels are verified live. The private channels (position/order/balance) are
+  **unverified** until a real API key authenticates - I say so rather than
+  implying they work.
+- The default stays `rest` until the private login is proven on real keys.
+
 ### Answering, and never answering with nothing
 - An empty model response is a **failure**, not an answer. I never print a
   placeholder and move on - I name the cause (`length`, `content_filter`,

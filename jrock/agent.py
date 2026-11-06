@@ -54,6 +54,8 @@ AGENT COMMANDS
   /think [level]            how hard the model reasons: off|low|medium|high|max
                             (a setting, not a chat mode - just type to chat)
   /balance  bal  wallet     account balance: available, frozen, margin, PnL, equity
+  /ws [on|off|test]         WebSocket: connection state, toggle market data source,
+                            or open a real connection and print 3 live frames
   /positions                open positions with entry, mark, liq and unrealized PnL
   /orders                   pending orders
   /price [SYMBOL]           last / mark price for your symbols
@@ -116,6 +118,7 @@ THINKING LEVEL
 AGENT_BARE: dict[str, str] = {
     "help": "/help", "?": "/help", "models": "/models", "model": "/models",
     "soul": "/soul", "memory": "/memory", "think": "/think",
+    "ws": "/ws", "websocket": "/ws",
     "verify": "/verify", "diagnose": "/diagnose", "autopsy": "/autopsy",
     "mcp": "/mcp", "skill": "/skill", "skills": "/skill",
     "check_ai": "/check_ai", "check_system": "/check_system",
@@ -271,7 +274,11 @@ class JRockAgent:
         self.memory = MemoryStore(self.s.data_dir / "memory.jsonl")
         self.store = SettingsStore(self.s.data_dir / "settings.json")
         self.engine = TraderEngine(self.s)
-        self.engine.status_extra = lambda: [f"thinking={self.thinking_level}"]
+        self.engine.status_extra = lambda: [
+            f"thinking={self.thinking_level}",
+            f"market_data={self.s.market_data_source}",
+        ]
+        self._ws_feed = None
         self.model: str = self.s.model
         self.mcp_servers: dict[str, str] = {}
         self.skills: dict[str, str] = {}
@@ -362,6 +369,8 @@ class JRockAgent:
         ok, msg = await self.engine.client.verify_credentials()
         lines.append(f"Bitunix: {'OK' if ok else 'FAIL'} - {msg}")
         lines.append(f"Thinking: {self.thinking_level}")
+        lines.append(f"Market data: {self.s.market_data_source}" + (
+            " (WebSocket)" if self.s.market_data_source == "ws" else " (REST polling)"))
         lines.append(f"Permissions: auto_accept_edit={self.perms.auto_accept_edit} "
                      f"device_access={self.perms.full_device_access}")
         return "\n".join(lines)
@@ -431,6 +440,8 @@ class JRockAgent:
             return self.soul()
         if cmd == "/think":
             return self.cmd_think(rest)
+        if cmd == "/ws":
+            return await self.cmd_ws(rest)
         if cmd == "/balance":
             return await self.cmd_balance()
         if cmd == "/positions":
@@ -759,6 +770,101 @@ class JRockAgent:
         lines += ["", f"Request parameter: {describe_params(params)}",
                   "", "Set it with: /think off|low|medium|high|max",
                   "You do not need /think to chat - just type normally."]
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------ websocket
+    async def cmd_ws(self, rest: str) -> str:
+        """`/ws` - connection state, `/ws on|off` - toggle, `/ws test` - real probe."""
+        arg = (rest or "").strip().lower()
+
+        if arg in ("on", "off"):
+            self.s.market_data_source = "ws" if arg == "on" else "rest"
+            self.store.set("market_data_source", self.s.market_data_source)
+            mirror_env(ROOT / ".env", "MARKET_DATA_SOURCE", self.s.market_data_source)
+            if arg == "off" and self._ws_feed is not None:
+                await self._ws_feed.stop()
+                self._ws_feed = None
+            note = ""
+            if arg == "on" and not self._has_bitunix_keys():
+                note = ("\nNote: no BITUNIX_API_KEY/SECRET set, so private channels "
+                        "(position/order/balance) cannot authenticate. Public market "
+                        "data works; the engine will fall back to REST for account state.")
+            return (f"MARKET_DATA_SOURCE = {self.s.market_data_source}"
+                    f" (persisted to data/settings.json and .env){note}")
+
+        if arg in ("test", "probe"):
+            return await self._ws_test()
+
+        if arg in ("", "status", "show"):
+            return self._ws_status()
+
+        return ("Usage: /ws            show connection state\n"
+                "       /ws on|off     switch market data source\n"
+                "       /ws test       open a real connection and print 3 frames")
+
+    def _ws_status(self) -> str:
+        from .trader.ws import WSConfig, PUBLIC_CHANNELS, PRIVATE_CHANNELS
+
+        lines = ["=== websocket ===",
+                 f"market_data_source = {self.s.market_data_source}",
+                 f"public url  = {self.s.bitunix_ws_public}",
+                 f"private url = {self.s.bitunix_ws_private}",
+                 f"credentials = {'present' if self._has_bitunix_keys() else 'MISSING'}"]
+
+        feed = self._ws_feed
+        if feed is None:
+            lines.append("connection: not started (run /ws test to probe, /ws on to enable)")
+        else:
+            st = feed.ws.stats()
+            lines += [
+                f"connection: {'CONNECTED' if st['connected'] else 'DISCONNECTED'}",
+                f"uptime: {st['uptime_s']}s   reconnects: {st['reconnects']}",
+                f"subscriptions: {st['subscriptions']}   messages: {st['messages']}   dropped: {st['dropped']}",
+                f"heartbeat: pings={st['pings_sent']} pongs={st['pongs_received']}",
+                f"last message: {st['last_message_age_s']}s ago",
+            ]
+            if st["last_error"]:
+                lines.append(f"last error: {st['last_error']}")
+            subs = ", ".join(f"{s['ch']}:{s.get('symbol','*')}" for s in feed.ws.subs[:12])
+            lines.append(f"channels: {subs}")
+
+        lines += ["", "public channels:  " + ", ".join(sorted(set(PUBLIC_CHANNELS.values()))),
+                  "private channels: " + ", ".join(sorted(PRIVATE_CHANNELS.values()))]
+        return "\n".join(lines)
+
+    async def _ws_test(self) -> str:
+        """Open a real public connection, print the first 3 raw frames, close."""
+        import json as _json
+        from .trader.ws import WSConfig, BitunixWebSocket
+
+        symbol = (self.s.symbols or ["BTCUSDT"])[0]
+        cfg = WSConfig.from_settings(self.s)
+        ws = BitunixWebSocket(cfg)
+        ws.subscribe("ticker", symbol)
+        frames: list[dict] = []
+        ws.on("ticker", lambda ev: frames.append(ev.raw) if len(frames) < 3 else None)
+
+        lines = [f"=== ws test: {cfg.public_url} ===",
+                 f"subscribing: ticker {symbol}"]
+        await ws.start()
+        try:
+            deadline = asyncio.get_event_loop().time() + 20
+            while len(frames) < 3 and asyncio.get_event_loop().time() < deadline:
+                await asyncio.sleep(0.2)
+        finally:
+            st = ws.stats()
+            await ws.stop()
+
+        lines.append(f"connected={st['connected']} messages={st['messages']} "
+                     f"reconnects={st['reconnects']} dropped={st['dropped']}")
+        if not frames:
+            lines.append("NO FRAMES RECEIVED - the socket did not push within 20s.")
+            if st["last_error"]:
+                lines.append(f"last error: {st['last_error']}")
+            return "\n".join(lines)
+        for i, f in enumerate(frames, 1):
+            lines.append(f"[{i}] {_json.dumps(f)[:300]}")
+        lines.append("closed cleanly.")
         return "\n".join(lines)
 
     # ------------------------------------------------- account / market queries

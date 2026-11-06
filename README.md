@@ -333,16 +333,86 @@ code review, or strategy analysis - harder problems, but slower and more tokens.
 
 ---
 
+## WebSocket (`/ws`)
+
+The engine can take live prices from the Bitunix WebSocket instead of polling
+REST. `MARKET_DATA_SOURCE=rest|ws` (default **`rest`**) selects it; `/ws on` and
+`/ws off` switch it at runtime and persist the choice.
+
+```
+/ws            connection state, uptime, reconnects, channels, message counts
+/ws on|off     switch market data source (persisted)
+/ws test       open a real connection, print the first 3 raw frames, close
+```
+
+### What was actually wrong before
+
+The old `ws.py` was **dead code** - nothing imported it - and every public
+channel name in it was wrong. The server accepts a bad channel name, replies
+`{"op":"connect","data":{"result":true}}`, and then never pushes anything, so
+the failure was silent.
+
+| Old (wrong) | Correct | Live result |
+|---|---|---|
+| `market_price` | `price` | old: 0 frames, new: real `mp`/`ip`/`fr` |
+| `market_ticker` | `ticker` | old: 0 frames, new: real `la`/`o`/`h`/`l` |
+| `market_tickers` | `tickers` | old: 0 frames, new: real array |
+| `market_trade` | `trade` | old: 0 frames, new: real trades |
+| `market_kline_1hour` | `market_kline_60min` | old: `data={}`, new: real OHLC |
+
+### Audit
+
+| Item | Status |
+|---|---|
+| WS client exists | **VERIFIED** - `jrock/trader/ws.py`, live-connected |
+| Public: `price` | **VERIFIED** - real frames captured |
+| Public: `ticker` | **VERIFIED** - real frames captured |
+| Public: `tickers` | **VERIFIED** - real frames captured |
+| Public: `trade` | **VERIFIED** - real frames captured |
+| Public: `depth_books` / `book1/5/15` | **VERIFIED** - real frames captured |
+| Public: kline (all intervals) | **VERIFIED** - `1min`..`1month`; `1hour` is invalid |
+| Private: `position` / `order` / `balance` | **UNTESTED** - no API keys in the build sandbox |
+| Private login signature | **VERIFIED** against the official Go demo (`generateSign`) |
+| Private live handshake | **UNTESTED** - cannot authenticate without keys |
+| Heartbeat (ping/pong) | **VERIFIED** - 3 pings, 3 pongs, ~0.17s round trip |
+| Heartbeat timeout -> reconnect | **VERIFIED** - no pong closes the socket |
+| Reconnect + backoff | **VERIFIED** - 0.3s, 0.6s, 1.2s, 2.0s (capped) |
+| Re-subscribe after reconnect | **VERIFIED** - resumed frames after recovery |
+| Dispatcher / typed events | **VERIFIED** - `Event` objects, prefix + `*` handlers |
+| Unknown channel ignored | **VERIFIED** - logged at debug, loop continues |
+| Backpressure drop counter | **VERIFIED** - bounded queue, `dropped` counter |
+| Clean shutdown | **VERIFIED** - zero orphaned asyncio tasks |
+| Tests | **PARTIAL** - signing unit-tested; WS proven by real connections, not mocks |
+
+**Why the default is `rest`:** the public layer is proven, but the private
+login handshake has never been exercised against the real server because this
+environment has no `BITUNIX_API_KEY`/`BITUNIX_API_SECRET`. Switching the engine
+onto WS by default would mean trusting an unverified auth path with real
+positions. Set `MARKET_DATA_SOURCE=ws` yourself once you have confirmed
+`/ws test` and a private login on your own keys.
+
+### Heartbeat detail
+
+The client sends `{"op":"ping","ping":<unix seconds>}` and the server answers
+`{"op":"ping","ts":...,"pong":<echoed>,"ping":<server seconds>}`. The server
+does **not** send its own ping (verified: 45s idle, zero frames), so the client
+must drive it. A missing pong within `pong_timeout` closes the socket to force
+a reconnect.
+
+---
+
 ## Tests
 
 ```bash
 python -m pytest -q tests
 ```
 
-153 tests covering indicators, risk math, all 16 strategies (including empty and
+249 tests covering indicators, risk math, all 16 strategies (including empty and
 short-data inputs), aggregation rules, TP/SL planning, API-reference/client
-drift, model probing, request signing, CLI routing, and the thinking-level
-system (levels, aliases, persistence, and the exact request parameter sent).
+drift, model probing, request signing, CLI routing, the thinking-level system
+(levels, aliases, persistence, and the exact request parameter sent), the
+balance command, empty-model-response diagnosis, and the order builder's
+per-field validation.
 
 ---
 
