@@ -34,14 +34,20 @@ class PairRules:
     @classmethod
     def from_api(cls, d: dict) -> "PairRules":
         def f(k, default=0.0):
+            v = d.get(k, default)
+            if v is None or v == "":
+                return default
             try:
-                return float(d.get(k, default) or default)
+                return float(v)
             except (TypeError, ValueError):
                 return default
 
         def i(k, default=0):
+            v = d.get(k, default)
+            if v is None or v == "":
+                return default
             try:
-                return int(d.get(k, default) or default)
+                return int(v)
             except (TypeError, ValueError):
                 return default
 
@@ -90,6 +96,26 @@ def round_step(value: float, precision: int) -> float:
 
 def round_price(price: float, precision: int) -> float:
     return round(price, max(0, precision))
+
+
+def format_qty(qty: float, rules: "PairRules") -> str:
+    """Format a base-coin qty to the symbol's basePrecision as a string.
+
+    basePrecision == 0 means integer qty (e.g. AKEUSDT). round_step already
+    floors to the precision; this renders it without a trailing '.0'.
+    """
+    p = max(0, int(rules.base_precision))
+    if p == 0:
+        return str(int(round_step(qty, 0)))
+    return f"{round_step(qty, p):.{p}f}"
+
+
+def format_price(price: float, rules: "PairRules") -> str:
+    """Format a price to the symbol's quotePrecision as a string."""
+    p = max(0, int(rules.quote_precision))
+    if p == 0:
+        return str(int(round(price, 0)))
+    return f"{round(price, p):.{p}f}"
 
 
 def qty_from_notional(notional_usd: float, price: float, rules: PairRules) -> float:

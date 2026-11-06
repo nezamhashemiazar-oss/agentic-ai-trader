@@ -22,6 +22,8 @@ from .aggregator import Aggregate, aggregate
 from .client import BitunixClient, BitunixConfig
 from .errors import BitunixAPIError
 from .indicators import atr, to_candles
+from .order_builder import (OrderValidationError, build_order_body,
+                            debug_order_enabled, log_order_body)
 from .risk import (PairRules, Tier, position_size_by_risk, qty_from_notional,
                    roi_pct, round_price, round_step)
 from .strategies import build_strategies
@@ -321,23 +323,21 @@ class TraderEngine:
                 self.state.errors.append(f"leverage {sym}: {e}")
 
         order_side = "BUY" if side == "LONG" else "SELL"
-        body: dict[str, Any] = {
-            "symbol": sym,
-            "qty": str(qty),
-            "side": order_side,
-            "tradeSide": "OPEN",
-            "orderType": "MARKET",
-            "reduceOnly": False,
-            "tpPrice": str(plan.tp),
-            "tpStopType": "MARK_PRICE",
-            "tpOrderType": "MARKET",
-            "slPrice": str(plan.sl),
-            "slStopType": "MARK_PRICE",
-            "slOrderType": "MARKET",
-        }
+        try:
+            body = build_order_body(
+                symbol=sym, qty=qty, side=order_side, tradeSide="OPEN",
+                orderType="MARKET", reduceOnly=False,
+                tpPrice=plan.tp, tpStopType="MARK_PRICE", tpOrderType="MARKET",
+                slPrice=plan.sl, slStopType="MARK_PRICE", slOrderType="MARKET",
+                rules=rules, known_symbols=set(self.rules) or None,
+            )
+        except OrderValidationError as e:
+            self.state.errors.append(f"order validation {sym}: {e}")
+            return {"ok": False, "reason": f"order validation failed: {e}"}
         try:
             res = await self.client.place_order(**body)
         except BitunixAPIError as e:
+            log_order_body(body, e)
             self.state.errors.append(f"place_order {sym}: {e}")
             return {"ok": False, "reason": f"place_order failed: {e}", "hint": e.hint}
 
@@ -482,11 +482,15 @@ class TraderEngine:
                 half = round_step(st.qty / 2, self.rules.get(sym, PairRules(sym)).base_precision)
                 if half > 0:
                     try:
-                        await self.client.place_order(
-                            symbol=sym, qty=str(half),
+                        close_body = build_order_body(
+                            symbol=sym, qty=half,
                             side="SELL" if side.upper() == "LONG" else "BUY",
                             tradeSide="CLOSE", positionId=pid,
-                            orderType="MARKET", reduceOnly=True)
+                            orderType="MARKET", reduceOnly=True,
+                            rules=self.rules.get(sym),
+                            known_symbols=set(self.rules) or None,
+                        )
+                        await self.client.place_order(**close_body)
                         st.partial_done = True
                         actions.append({"action": "partial_close", "symbol": sym,
                                         "qty": half, "roi": round(roi, 2)})

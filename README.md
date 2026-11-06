@@ -199,6 +199,34 @@ are base-coin amounts. Round qty down to `basePrecision`, price to `quotePrecisi
 **Error 10011** (timestamp skew) is auto-handled: the client resyncs its clock and
 retries once.
 
+**Error 10002** (Parameter error) is prevented locally. Every order body is built
+by `jrock/trader/order_builder.py`, which validates each field against the
+official spec **before** sending and raises a named local error instead of
+transmitting a malformed request:
+
+| Field | Rule enforced |
+|---|---|
+| `symbol` | must exist in the live `trading_pairs` list (else: closest matches) |
+| `side` | `BUY` \| `SELL` (case-normalized) |
+| `orderType` | `LIMIT` \| `MARKET` (case-normalized) |
+| `tradeSide` | `OPEN` \| `CLOSE` (case-normalized) |
+| `effect` | `GTC` \| `IOC` \| `FOK` \| `POST_ONLY`, LIMIT only |
+| `qty` | string, `>= minTradeVolume`, `<= maxMarketOrderVolume`, formatted to `basePrecision` |
+| `price` | string, required for LIMIT, **absent** for MARKET, formatted to `quotePrecision` |
+| `positionId` | required when `tradeSide == CLOSE` |
+| `reduceOnly` | boolean |
+| `tpPrice`/`slPrice` | strings formatted to `quotePrecision` |
+| `clientId` | alphanumeric, ≤ 32 chars |
+
+> **The AKEUSDT 10002.** `AKEUSDT` has `basePrecision: 0` — it takes **integer**
+> qty. `PairRules.from_api` used `int(d.get(k, default) or default)`, and `0` is
+> falsy, so the real precision `0` was silently replaced by the default `4`. The
+> engine then sent `"qty":"1686.3406"` and the exchange rejected it. Fixed by
+> reading the value without the `or` coercion, and by formatting qty through
+> `format_qty()` (which renders `basePrecision 0` as an integer).
+
+Set `BITUNIX_DEBUG_ORDER=true` to log the exact body sent next to any error.
+
 ---
 
 ## Thinking level (`/think`)
