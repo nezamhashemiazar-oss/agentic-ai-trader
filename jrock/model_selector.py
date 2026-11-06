@@ -33,6 +33,8 @@ from typing import Any
 
 import aiohttp
 
+from .thinking import detect_reasoning
+
 QUALITY_HINTS: list[tuple[str, float]] = [
     (r"gpt-5", 100), (r"o3", 98), (r"o4", 97), (r"gpt-4\.1", 95), (r"gpt-4o(?!-mini)", 90),
     (r"claude.*(opus|sonnet-4|4\.5)", 96), (r"claude.*sonnet", 88), (r"claude.*haiku", 70),
@@ -56,6 +58,8 @@ class ModelInfo:
     prompt_price: float | None = None
     completion_price: float | None = None
     raw: dict = field(default_factory=dict)
+    supports_reasoning: bool | None = None
+    reasoning_param: str | None = None
 
     @property
     def score(self) -> float:
@@ -166,6 +170,9 @@ def parse_model(item: Any) -> ModelInfo | None:
             elif val > 0:
                 info.free = False
             break
+
+    # 5) reasoning capability - decides which thinking parameter we may send
+    info.supports_reasoning, info.reasoning_param = detect_reasoning(raw, info.id)
 
     return info
 

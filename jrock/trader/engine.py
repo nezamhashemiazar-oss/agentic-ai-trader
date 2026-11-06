@@ -15,7 +15,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ..config import Settings
 from .aggregator import Aggregate, aggregate
@@ -98,6 +98,8 @@ class TraderEngine:
         self.trades_path = self.data_dir / "trades.jsonl"
         self.tpsl_path = self.data_dir / "tpsl.jsonl"
         self.signals_path = self.data_dir / "signals.jsonl"
+        # Optional hook so the agent can add its own settings to `status`.
+        self.status_extra: Callable[[], list[str]] | None = None
 
     # ================================================================ lifecycle
     async def start(self) -> None:
@@ -805,7 +807,7 @@ class TraderEngine:
         except Exception as e:  # noqa: BLE001
             ok, msg = False, str(e)
         positions = await self.open_positions()
-        return "\n".join([
+        lines = [
             "=== status ===",
             f"engine={'ON' if s.engine_on else 'OFF'} scan={'ON' if s.scan_on else 'OFF'} "
             f"autotrade={'ON' if s.autotrade else 'OFF'} report={'ON' if s.report_on else 'OFF'}",
@@ -814,4 +816,10 @@ class TraderEngine:
             f"open positions: {len(positions)}",
             f"scans={s.scans} last_scan={time.strftime('%H:%M:%S', time.localtime(s.last_scan_ts)) if s.last_scan_ts else 'never'}",
             f"errors={len(s.errors)}" + (f" last={s.errors[-1]}" if s.errors else ""),
-        ])
+        ]
+        if self.status_extra:
+            try:
+                lines.extend(self.status_extra())
+            except Exception as e:  # noqa: BLE001
+                lines.append(f"status_extra: {type(e).__name__}: {e}")
+        return "\n".join(lines)

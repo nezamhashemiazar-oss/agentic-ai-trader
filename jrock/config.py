@@ -5,6 +5,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .thinking import level_from_env
+
 try:
     from dotenv import load_dotenv
 except Exception:  # pragma: no cover
@@ -63,6 +65,7 @@ class Settings:
     tf_min_confidence: float = 60.0
     scan_interval: int = 30
     report_interval: int = 30
+    thinking_level: str = "medium"
 
     @property
     def data_dir(self) -> Path:
@@ -108,4 +111,5 @@ def load_settings(env_file: str | os.PathLike | None = None) -> Settings:
         tf_min_confidence=_f("TRADE_TF_MIN_CONFIDENCE", 60.0),
         scan_interval=_i("TRADE_SCAN_INTERVAL", 30),
         report_interval=_i("TRADE_REPORT_INTERVAL", 30),
+        thinking_level=level_from_env(),
     )

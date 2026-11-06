@@ -48,7 +48,7 @@ python -m jrock.cli --help-cmds
 | `/add_mcp <name> <cmd>` / `/mcp` | register / list MCP servers |
 | `/add_skill <name> <path>` / `/skill` | register / list skills |
 | `/add_soul <text\|@file>` / `/soul` | append to / show the soul |
-| `/think <question>` | structured reasoning: memory, unknowns, plan, next action |
+| `/think [level]` | how hard the model reasons: `off`/`low`/`medium`/`high`/`max` |
 | `/memory [query]` | memory stats, or search memory |
 | `/code_review [path]` | AST + regex review: syntax, long functions, bare except, eval, TODOs |
 | `/bug_fix [path]` | review + apply safe fixes (permission-gated) |
@@ -201,15 +201,67 @@ retries once.
 
 ---
 
+## Thinking level (`/think`)
+
+`/think` sets **how much the model reasons before it answers**. It is a
+**setting, not a chat mode**.
+
+**You do not need `/think` to talk to the agent.** Just type normally and the
+agent replies. `/think` only changes how hard it thinks.
+
+| Level | What it means |
+|---|---|
+| `off` | no reasoning, fastest, cheapest |
+| `low` | short reasoning |
+| `medium` | default - balanced |
+| `high` | long reasoning, more tokens |
+| `max` | deepest reasoning, most tokens, slowest |
+
+```
+/think              show the current level and what it does
+/think status       same as above
+/think high         set it (persisted)
+```
+
+Aliases: `none`->`off`, `min`->`low`, `med`->`medium`, `hi`->`high`,
+`maximum`->`max`. Case-insensitive. An invalid level prints the valid list and
+the closest match - it never crashes.
+
+**Where it is stored.** `data/settings.json` (survives restarts) and mirrored to
+`THINKING_LEVEL=` in `.env`. Default is `medium`. Precedence on read:
+store > `.env` > default.
+
+**What it actually sends.** The level maps to a real provider parameter, chosen
+from the model's own `/models` metadata - never guessed:
+
+| Level | `reasoning_effort` (OpenAI-compatible) | `thinking_budget` (budget-style) |
+|---|---|---|
+| `off` | *nothing sent* | *nothing sent* |
+| `low` | `low` | `1024` |
+| `medium` | `medium` | `4096` |
+| `high` | `high` | `16384` |
+| `max` | `high` | `32768` |
+
+`off` sends **no reasoning parameter at all**. A model that does not advertise
+reasoning support gets **no parameter** either - we never send an unsupported
+field and let the request 400. The level and the parameter actually sent are
+logged at debug level.
+
+**Which level to use.** `off`/`low` for quick chat. `high`/`max` for debugging,
+code review, or strategy analysis - harder problems, but slower and more tokens.
+
+---
+
 ## Tests
 
 ```bash
 python -m pytest -q tests
 ```
 
-57 tests covering indicators, risk math, all 16 strategies (including empty and
-short-data inputs), aggregation rules, TP/SL planning, and API-reference/client
-drift.
+153 tests covering indicators, risk math, all 16 strategies (including empty and
+short-data inputs), aggregation rules, TP/SL planning, API-reference/client
+drift, model probing, request signing, CLI routing, and the thinking-level
+system (levels, aliases, persistence, and the exact request parameter sent).
 
 ---
 

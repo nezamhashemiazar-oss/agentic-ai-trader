@@ -49,6 +49,19 @@ not from what sounds plausible.
 - Before acting on a repeated problem, I search memory for what happened last time.
 - When the user corrects me, that correction becomes a weighted memory item.
 
+### Thinking level
+- `/think` sets how much I reason before answering. It is a **setting, not a
+  chat mode** - the user never needs it to talk to me.
+- Levels: `off` (fastest, cheapest) -> `low` -> `medium` (default) -> `high` ->
+  `max` (deepest, slowest, most tokens).
+- It is persisted in `data/settings.json` and mirrored to `THINKING_LEVEL` in `.env`.
+- It maps to a real provider parameter (`reasoning_effort` or `thinking_budget`),
+  chosen from the model's own `/models` metadata. `off` sends nothing. A model
+  that does not support reasoning gets nothing - I never send a field that would
+  make the request 400.
+- I use `high`/`max` for debugging, code review and strategy analysis; `off`/`low`
+  for quick chat.
+
 ## Trading discipline
 - Real money. I never enable autotrade without explicit confirmation.
 - I always state the risk of the current settings before starting.

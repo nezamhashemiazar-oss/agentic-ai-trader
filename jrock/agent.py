@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import logging
 import re
 import subprocess
 import sys
@@ -21,9 +22,15 @@ from .config import ROOT, Settings, load_settings
 from .memory import MemoryStore
 from .model_selector import autoset_model, persist_model
 from .permissions import PermissionManager
+from .settings_store import SettingsStore, mirror_env
+from .thinking import (DEFAULT_LEVEL, LEVEL_HELP, LEVELS, ONE_LINER,
+                       build_reasoning_params, closest_level, describe_params,
+                       normalize_level)
 from .trader.engine import TraderEngine
 
 SOUL_PATH = ROOT / "soul" / "jrock.soul.md"
+
+log = logging.getLogger("jrock.agent")
 
 HELP = """J+Rock commands
 ================
@@ -41,7 +48,8 @@ AGENT COMMANDS
   /skill                    list skills
   /add_soul <text|@file>    append to the soul/persona
   /soul                     show the current soul
-  /think <question>         structured reasoning pass (plan, risks, next step)
+  /think [level]            how hard the model reasons: off|low|medium|high|max
+                            (a setting, not a chat mode - just type to chat)
   /memory [query]           memory stats, or search memory
   /code_review [path]       static review: syntax, smells, risky patterns
   /bug_fix [path]           find + propose fixes (permission-gated)
@@ -78,6 +86,13 @@ PERMISSIONS
 FREE TEXT
   anything else (e.g. "switch to free model", "why did my order fail?")
   goes to the model. exit / quit / Ctrl-D leave the REPL.
+
+THINKING LEVEL
+  /think            show the current level and what it does
+  /think high       set it (off|low|medium|high|max, aliases: none/min/med/hi/maximum)
+  Higher = better reasoning on hard problems, slower and more tokens.
+  off/low for quick chat; high/max for debugging, code review, strategy analysis.
+  You do NOT need /think to talk to me - it only changes how hard I think.
 """
 
 # Bare words that mean an agent command (no leading slash needed).
@@ -212,11 +227,53 @@ class JRockAgent:
         )
         self.tools = Tools(self.perms)
         self.memory = MemoryStore(self.s.data_dir / "memory.jsonl")
+        self.store = SettingsStore(self.s.data_dir / "settings.json")
         self.engine = TraderEngine(self.s)
+        self.engine.status_extra = lambda: [f"thinking={self.thinking_level}"]
         self.model: str = self.s.model
         self.mcp_servers: dict[str, str] = {}
         self.skills: dict[str, str] = {}
         self._load_registry()
+
+    # ------------------------------------------------------- thinking level
+    @property
+    def thinking_level(self) -> str:
+        """Current level: persisted store > .env > default."""
+        stored = normalize_level(self.store.get("thinking_level"))
+        if stored:
+            return stored
+        return normalize_level(self.s.thinking_level) or DEFAULT_LEVEL
+
+    @thinking_level.setter
+    def thinking_level(self, value: str) -> None:
+        lvl = normalize_level(value) or DEFAULT_LEVEL
+        self.store.set("thinking_level", lvl)
+        self.s.thinking_level = lvl
+        mirror_env(ROOT / ".env", "THINKING_LEVEL", lvl)
+
+    def reasoning_params(self, model: str | None = None) -> dict:
+        """Provider fields for the current level, honouring model capability."""
+        mid = model or self.model or self.s.model
+        supports, style = self._model_reasoning(mid)
+        return build_reasoning_params(self.thinking_level, supports, style)
+
+    def _model_reasoning(self, model_id: str) -> tuple[bool | None, str | None]:
+        """Look up cached /models metadata for a model's reasoning support."""
+        if not model_id:
+            return None, None
+        cached = self.store.get("model_meta") or {}
+        meta = cached.get(model_id)
+        if isinstance(meta, dict):
+            return meta.get("supports_reasoning"), meta.get("reasoning_param")
+        return None, None
+
+    def cache_model_meta(self, infos) -> None:
+        """Persist reasoning capability from a /models listing."""
+        meta = dict(self.store.get("model_meta") or {})
+        for m in infos:
+            meta[m.id] = {"supports_reasoning": m.supports_reasoning,
+                          "reasoning_param": m.reasoning_param}
+        self.store.set("model_meta", meta)
 
     @property
     def registry_path(self) -> Path:
@@ -262,6 +319,7 @@ class JRockAgent:
             lines.append(f"Model pinned: {self.model}")
         ok, msg = await self.engine.client.verify_credentials()
         lines.append(f"Bitunix: {'OK' if ok else 'FAIL'} - {msg}")
+        lines.append(f"Thinking: {self.thinking_level}")
         lines.append(f"Permissions: auto_accept_edit={self.perms.auto_accept_edit} "
                      f"device_access={self.perms.full_device_access}")
         return "\n".join(lines)
@@ -428,6 +486,10 @@ class JRockAgent:
             "max_tokens": 800,
             "temperature": 0.2,
         }
+        reasoning = self.reasoning_params(model)
+        payload.update(reasoning)
+        log.debug("chat: thinking_level=%s model=%s params=%s",
+                  self.thinking_level, model, describe_params(reasoning))
         url = f"{self.s.base_url.rstrip('/')}/chat/completions"
         try:
             async with aiohttp.ClientSession() as sess:
@@ -467,6 +529,7 @@ class JRockAgent:
             return f"failed: {e}"
         if free_only:
             infos = [m for m in infos if m.free]
+        self.cache_model_meta(infos)
         infos.sort(key=lambda m: m.score, reverse=True)
         n_free = sum(1 for m in infos if m.free)
         lines = [f"{len(infos)} models on {self.s.base_url} "
@@ -533,27 +596,47 @@ class JRockAgent:
             return self.add_soul(r.output)
         return self.add_soul(rest)
 
-    def cmd_think(self, question: str) -> str:
-        if not question:
-            return "Usage: /think <question>"
-        recalled = self.memory.search(question, k=5)
-        lines = [f"THINK: {question}", "", "1) What is actually being asked",
-                 f"   - {question}", "", "2) What I know (memory)"]
-        if recalled:
-            for m in recalled:
-                lines.append(f"   - [{m.kind}] {m.text[:160]}")
-        else:
-            lines.append("   - nothing relevant stored")
-        lines += ["", "3) Unknowns / risks",
-                  "   - anything not verified by running code is unverified",
-                  "   - exchange behaviour must be confirmed against docs/bitunix/",
-                  "", "4) Plan",
-                  "   - inspect the real code/data first",
-                  "   - make the smallest change that fixes the root cause",
-                  "   - verify by running it, not by reading it",
-                  "", "5) Next action",
-                  "   - run /check_system or /diagnose to get facts before editing"]
-        self.memory.episode("think", question[:120], "reasoned", ok=True)
+    def cmd_think(self, rest: str) -> str:
+        """`/think` - show or set the thinking level.
+
+        No argument (or `status`) prints the current level, the available
+        levels and one line explaining what it does. Never errors.
+        """
+        arg = (rest or "").strip()
+        current = self.thinking_level
+
+        if not arg or arg.lower() in ("status", "show", "current", "?"):
+            return self._think_status(current)
+
+        lvl = normalize_level(arg)
+        if lvl is None:
+            near = closest_level(arg)
+            lines = [f"'{arg}' is not a thinking level.", "",
+                     f"Valid levels: {' | '.join(LEVELS)}",
+                     "Aliases: none->off, min->low, med->medium, hi->high, maximum->max"]
+            if near:
+                lines.append(f"Closest match: {near}  (run: /think {near})")
+            lines.append("")
+            lines.append(f"Current level: {current}")
+            return "\n".join(lines)
+
+        self.thinking_level = lvl
+        params = self.reasoning_params()
+        self.memory.fact("thinking_level", lvl)
+        self.perms.audit.write("set_thinking_level", value=lvl)
+        return (f"Thinking level = {lvl} ({LEVEL_HELP[lvl]}).\n"
+                f"Persisted to data/settings.json and THINKING_LEVEL in .env.\n"
+                f"Request parameter: {describe_params(params)}")
+
+    def _think_status(self, current: str) -> str:
+        params = self.reasoning_params()
+        lines = [f"Thinking level: {current}", "", ONE_LINER, "", "Levels:"]
+        for lvl in LEVELS:
+            mark = "*" if lvl == current else " "
+            lines.append(f" {mark} {lvl:<7} {LEVEL_HELP[lvl]}")
+        lines += ["", f"Request parameter: {describe_params(params)}",
+                  "", "Set it with: /think off|low|medium|high|max",
+                  "You do not need /think to chat - just type normally."]
         return "\n".join(lines)
 
     def cmd_memory(self, query: str) -> str:
