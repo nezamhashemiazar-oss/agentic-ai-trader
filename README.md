@@ -49,6 +49,15 @@ python -m jrock.cli --help-cmds
 | `/add_skill <name> <path>` / `/skill` | register / list skills |
 | `/add_soul <text\|@file>` / `/soul` | append to / show the soul |
 | `/think [level]` | how hard the model reasons: `off`/`low`/`medium`/`high`/`max` |
+| `/balance` `bal` `wallet` `equity` `funds` | account table: available, frozen, margin, unrealized PnL, equity |
+| `/positions` | open positions: entry, mark, liq, leverage, margin, uPnL |
+| `/orders` | pending orders |
+| `/price [SYMBOL]` | last / mark price for your symbols |
+| `/funding [SYMBOL]` | current funding rate |
+| `/leverage` / `/margin` | leverage and margin mode per symbol |
+| `/pnl` | unrealized PnL across open positions |
+| `/status` | engine + API + account summary |
+| `/symbols [SEARCH]` | tradable symbols with precision and min volume |
 | `/memory [query]` | memory stats, or search memory |
 | `/code_review [path]` | AST + regex review: syntax, long functions, bare except, eval, TODOs |
 | `/bug_fix [path]` | review + apply safe fixes (permission-gated) |
@@ -274,6 +283,50 @@ from the model's own `/models` metadata - never guessed:
 reasoning support gets **no parameter** either - we never send an unsupported
 field and let the request 400. The level and the parameter actually sent are
 logged at debug level.
+
+**Output budget.** A high thinking level needs room for reasoning tokens *on top
+of* the answer, so `max_tokens` scales with the level (`off` 800, `low` 1200,
+`medium` 2000, `high` 6000, `max` 12000). If a configured cap is smaller than
+the thinking budget, a warning is logged - that combination is what produces an
+empty answer.
+
+## How a line is routed
+
+Every line you type goes through four steps, in this order:
+
+1. `/command` -> the agent command dispatcher
+2. a bare word that names an agent command (`balance`, `positions`, `help`, ...) -> the agent
+3. engine command grammar (`leverage 20`, `scan off`, `min agreeing strategies 3`) -> the engine
+4. anything else -> the model, as natural language
+
+A word that is both a query and a setter is disambiguated by its arguments:
+`leverage` reads, `leverage 20` sets. `report` reads status, `report on` toggles
+the engine report.
+
+**Trader words are never sent to the model.** `balance`, `bal`, `wallet`,
+`equity`, `funds`, `positions`, `orders`, `price`, `funding`, `leverage`,
+`margin`, `pnl`, `status`, `symbols`, `pairs`, `markets` all have real handlers.
+
+## Empty model responses
+
+An empty completion is a **failure**, never a normal answer. The CLI diagnoses
+the cause and names it:
+
+| Cause | Meaning |
+|---|---|
+| `length_zero_tokens` | hit the token cap before producing anything |
+| `length_reasoning_only` | every completion token was a reasoning token |
+| `length_no_text` | hit the cap with no text emitted |
+| `content_filter` | the provider blocked the output |
+| `tool_call_only` | the model wanted a tool call and wrote no prose |
+| `no_choices` | HTTP 200 with an empty `choices` array |
+| `error_in_200` | the provider returned an error object inside a 200 |
+| `whitespace_only` | content was only whitespace |
+
+For the two `length` causes the CLI **retries once with `thinking=off`** and
+tells you it did. If the retry also fails you get the cause, the finish reason,
+the token counts, the configured `max_tokens`, and the next action - never
+`(model returned an empty message)`.
 
 **Which level to use.** `off`/`low` for quick chat. `high`/`max` for debugging,
 code review, or strategy analysis - harder problems, but slower and more tokens.

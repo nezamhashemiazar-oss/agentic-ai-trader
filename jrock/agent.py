@@ -18,7 +18,10 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .account import (BalanceReport, is_demo_url, missing_keys_message,
+                      parse_accounts, render_balance)
 from .config import ROOT, Settings, load_settings
+from .empty_response import (budget_warning, diagnose_empty, render_empty)
 from .memory import MemoryStore
 from .model_selector import autoset_model, persist_model
 from .permissions import PermissionManager
@@ -50,6 +53,16 @@ AGENT COMMANDS
   /soul                     show the current soul
   /think [level]            how hard the model reasons: off|low|medium|high|max
                             (a setting, not a chat mode - just type to chat)
+  /balance  bal  wallet     account balance: available, frozen, margin, PnL, equity
+  /positions                open positions with entry, mark, liq and unrealized PnL
+  /orders                   pending orders
+  /price [SYMBOL]           last / mark price for your symbols
+  /funding [SYMBOL]         current funding rate
+  /leverage                 leverage and margin mode per symbol
+  /margin                   margin mode (ISOLATION|CROSS) per symbol
+  /pnl                      unrealized PnL across open positions
+  /status                   engine + API + account summary
+  /symbols                  tradable symbols (or search: /symbols BTC)
   /memory [query]           memory stats, or search memory
   /code_review [path]       static review: syntax, smells, risky patterns
   /bug_fix [path]           find + propose fixes (permission-gated)
@@ -96,6 +109,10 @@ THINKING LEVEL
 """
 
 # Bare words that mean an agent command (no leading slash needed).
+#
+# Every word a trader would naturally type must land on a REAL handler. A word
+# that is not here and is not engine grammar falls through to the model, which
+# is how `balance` used to produce an empty answer.
 AGENT_BARE: dict[str, str] = {
     "help": "/help", "?": "/help", "models": "/models", "model": "/models",
     "soul": "/soul", "memory": "/memory", "think": "/think",
@@ -103,7 +120,32 @@ AGENT_BARE: dict[str, str] = {
     "mcp": "/mcp", "skill": "/skill", "skills": "/skill",
     "check_ai": "/check_ai", "check_system": "/check_system",
     "code_review": "/code_review", "bug_fix": "/bug_fix", "simplify": "/simplify",
+    # account / market queries - first-class, never sent to the model
+    "balance": "/balance", "bal": "/balance", "wallet": "/balance",
+    "equity": "/balance", "funds": "/balance",
+    "positions": "/positions", "position": "/positions",
+    "orders": "/orders", "order": "/orders",
+    "price": "/price", "prices": "/price", "quote": "/price",
+    "funding": "/funding", "funding_rate": "/funding",
+    "leverage": "/leverage", "lev": "/leverage",
+    "margin": "/margin", "margin_mode": "/margin",
+    "pnl": "/pnl", "p&l": "/pnl",
+    "status": "/status", "report": "/status",
+    "symbols": "/symbols", "pairs": "/symbols", "markets": "/symbols",
 }
+
+# Words that are deliberately NOT commands: they are free text for the model.
+# Listed explicitly so the routing table can prove the decision was made.
+FREE_TEXT_WORDS: tuple[str, ...] = (
+    "why", "how", "what", "explain", "should", "can", "is", "are",
+    "tell", "show", "give", "write", "fix", "review", "analyze",
+)
+
+# Query commands that ALSO exist as engine setters. With arguments they are
+# engine syntax ("leverage 20"); bare they are a read ("leverage").
+QUERY_COMMANDS: frozenset[str] = frozenset({
+    "/leverage", "/margin", "/symbols", "/price", "/funding", "/status", "/pnl",
+})
 
 # Natural-language intents we handle deterministically instead of guessing.
 FREE_MODEL_INTENT = re.compile(
@@ -389,6 +431,26 @@ class JRockAgent:
             return self.soul()
         if cmd == "/think":
             return self.cmd_think(rest)
+        if cmd == "/balance":
+            return await self.cmd_balance()
+        if cmd == "/positions":
+            return await self.cmd_positions()
+        if cmd == "/orders":
+            return await self.cmd_orders()
+        if cmd == "/price":
+            return await self.cmd_price(rest)
+        if cmd == "/funding":
+            return await self.cmd_funding(rest)
+        if cmd == "/leverage":
+            return await self.cmd_leverage(rest)
+        if cmd == "/margin":
+            return await self.cmd_margin(rest)
+        if cmd == "/pnl":
+            return await self.cmd_pnl()
+        if cmd == "/status":
+            return await self.engine.status()
+        if cmd == "/symbols":
+            return await self.cmd_symbols(rest)
         if cmd == "/memory":
             return self.cmd_memory(rest)
         if cmd == "/code_review":
@@ -429,6 +491,10 @@ class JRockAgent:
         if head in AGENT_BARE:
             mapped = AGENT_BARE[head]
             rest = raw.strip()[len(head):].strip()
+            # A query word followed by engine-style arguments is an engine
+            # SETTER, not a query: "leverage 20" sets, "leverage" reads.
+            if mapped in QUERY_COMMANDS and rest and self.engine.looks_like_command(raw):
+                return await self.engine.command(raw)
             return await self.handle(f"{mapped} {rest}".strip())
 
         # 2) natural-language intents we can act on without the model
@@ -457,10 +523,45 @@ class JRockAgent:
                     f"{res.message}")
         return ("No free model worked with this key.\n" + res.message)
 
-    async def chat(self, text: str) -> str:
-        """Send free text to the configured model."""
-        from .model_selector import autoset_model
+    # Base output cap. A high thinking level needs room for reasoning tokens
+    # ON TOP of the answer, so the cap is raised rather than left to starve.
+    BASE_MAX_TOKENS = 800
+    THINKING_MAX_TOKENS = {"off": 800, "low": 1200, "medium": 2000,
+                           "high": 6000, "max": 12000}
+
+    def _max_tokens_for(self, level: str) -> int:
+        """Output cap that leaves room for the reasoning budget."""
+        return self.THINKING_MAX_TOKENS.get(level, self.BASE_MAX_TOKENS)
+
+    async def _post_chat(self, url: str, payload: dict) -> tuple[int, str, dict | None]:
+        """One HTTP call. Returns (status, raw_text, parsed_json_or_None)."""
         import aiohttp
+        try:
+            async with aiohttp.ClientSession() as sess:
+                async with sess.post(
+                    url,
+                    headers={"Authorization": f"Bearer {self.s.api_key}",
+                             "Content-Type": "application/json"},
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=120),
+                ) as r:
+                    body = await r.text()
+                    try:
+                        parsed = json.loads(body)
+                    except json.JSONDecodeError:
+                        parsed = None
+                    return r.status, body, parsed
+        except Exception as e:  # noqa: BLE001
+            return 0, f"{type(e).__name__}: {e}", None
+
+    async def chat(self, text: str) -> str:
+        """Send free text to the configured model.
+
+        An empty completion is a FAILURE, never a normal answer. We diagnose the
+        cause, and when the cause is reasoning-budget exhaustion we retry once
+        with thinking off and say so.
+        """
+        from .model_selector import autoset_model
 
         if not self.s.api_key:
             return (f"I could not send that to a model: API_KEY is empty in .env.\n"
@@ -479,42 +580,63 @@ class JRockAgent:
         system = ("You are J+Rock, an agentic coding and trading-systems engineer. "
                   "Be direct, never fabricate results, say 'I don't know' when unsure. "
                   "You have a Bitunix futures engine; its commands are listed in /help.")
+        level = self.thinking_level
+        max_tokens = self._max_tokens_for(level)
+        reasoning = self.reasoning_params(model)
+
         payload = {
             "model": model,
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": text}],
-            "max_tokens": 800,
+            "max_tokens": max_tokens,
             "temperature": 0.2,
         }
-        reasoning = self.reasoning_params(model)
         payload.update(reasoning)
-        log.debug("chat: thinking_level=%s model=%s params=%s",
-                  self.thinking_level, model, describe_params(reasoning))
-        url = f"{self.s.base_url.rstrip('/')}/chat/completions"
-        try:
-            async with aiohttp.ClientSession() as sess:
-                async with sess.post(
-                    url,
-                    headers={"Authorization": f"Bearer {self.s.api_key}",
-                             "Content-Type": "application/json"},
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=90),
-                ) as r:
-                    body = await r.text()
-                    if r.status != 200:
-                        return (f"Model call failed: HTTP {r.status}: {body[:400]}\n"
-                                f"You said: {text!r}")
-                    d = json.loads(body)
-        except Exception as e:  # noqa: BLE001
-            return f"Model call failed: {type(e).__name__}: {e}"
+        log.debug("chat: thinking_level=%s model=%s max_tokens=%s params=%s",
+                  level, model, max_tokens, describe_params(reasoning))
 
-        choices = d.get("choices") or []
-        if not choices:
-            return f"Model returned no choices: {body[:300]}"
-        msg = choices[0].get("message") or {}
-        out = (msg.get("content") or "").strip()
-        self.memory.episode("chat", text[:120], out[:120], ok=True)
-        return out or "(model returned an empty message)"
+        warn = budget_warning(level, max_tokens, reasoning.get("thinking_budget"))
+        if warn:
+            log.warning("chat: %s", warn)
+
+        url = f"{self.s.base_url.rstrip('/')}/chat/completions"
+        status, body, parsed = await self._post_chat(url, payload)
+
+        if status != 200:
+            return (f"Model call failed: HTTP {status}: {body[:400]}\n"
+                    f"You said: {text!r}")
+
+        verdict = diagnose_empty(parsed, status)
+        if not verdict.is_empty:
+            out = parsed["choices"][0]["message"]["content"].strip()
+            self.memory.episode("chat", text[:120], out[:120], ok=True)
+            return out
+
+        # ---- empty response: log everything needed to diagnose it
+        log.warning("chat: EMPTY response cause=%s finish=%s completion_tokens=%s "
+                    "reasoning_tokens=%s status=%s level=%s max_tokens=%s body=%s",
+                    verdict.cause, verdict.finish_reason, verdict.completion_tokens,
+                    verdict.reasoning_tokens, status, level, max_tokens, body[:800])
+
+        # ---- retry once with thinking off when the budget ate the answer
+        if verdict.retry_with_off and level != "off":
+            retry_payload = dict(payload)
+            for k in ("reasoning_effort", "thinking_budget"):
+                retry_payload.pop(k, None)
+            retry_payload["max_tokens"] = self.BASE_MAX_TOKENS
+            log.debug("chat: retrying with thinking=off (was %s)", level)
+            status2, body2, parsed2 = await self._post_chat(url, retry_payload)
+            if status2 == 200:
+                v2 = diagnose_empty(parsed2, status2)
+                if not v2.is_empty:
+                    out = parsed2["choices"][0]["message"]["content"].strip()
+                    self.memory.episode("chat", text[:120], out[:120], ok=True)
+                    return (f"[retried with thinking=off after an empty response at "
+                            f"level {level}]\n\n{out}")
+            log.warning("chat: retry with thinking=off also failed: %s", body2[:400])
+
+        self.memory.episode("chat", text[:120], f"EMPTY:{verdict.cause}", ok=False)
+        return render_empty(verdict, level, max_tokens)
 
     async def cmd_models(self, rest: str = "") -> str:
         from .model_selector import list_model_info
@@ -637,6 +759,179 @@ class JRockAgent:
         lines += ["", f"Request parameter: {describe_params(params)}",
                   "", "Set it with: /think off|low|medium|high|max",
                   "You do not need /think to chat - just type normally."]
+        return "\n".join(lines)
+
+    # ------------------------------------------------- account / market queries
+    def _has_bitunix_keys(self) -> bool:
+        return bool(self.s.bitunix_api_key and self.s.bitunix_api_secret)
+
+    async def cmd_balance(self) -> str:
+        """`/balance` - real account table from GET /api/v1/futures/account."""
+        from .trader.errors import BitunixAPIError
+
+        if not self._has_bitunix_keys():
+            return missing_keys_message()
+
+        try:
+            data = await self.engine.client.get_single_account()
+        except BitunixAPIError as e:
+            return (f"Bitunix rejected the account request: code {e.code}: {e.msg or e}\n"
+                    f"{getattr(e, 'hint', '')}".rstrip())
+        except Exception as e:  # noqa: BLE001
+            return f"Account request failed: {type(e).__name__}: {e}"
+
+        report = BalanceReport(
+            accounts=parse_accounts(data),
+            is_demo=is_demo_url(self.s.bitunix_base_url),
+            base_url=self.s.bitunix_base_url,
+        )
+        return render_balance(report)
+
+    async def cmd_positions(self) -> str:
+        from .trader.errors import BitunixAPIError
+        if not self._has_bitunix_keys():
+            return missing_keys_message()
+        try:
+            rows = await self.engine.client.get_pending_positions()
+        except BitunixAPIError as e:
+            return f"Bitunix error {e.code}: {e.msg or e}"
+        except Exception as e:  # noqa: BLE001
+            return f"positions request failed: {type(e).__name__}: {e}"
+        rows = rows or []
+        if not rows:
+            return "no open positions"
+        lines = ["=== open positions ==="]
+        for p in rows:
+            lines.append(
+                f"{p.get('symbol')} {p.get('side')} qty={p.get('qty')} "
+                f"entry={p.get('avgOpenPrice')} mark={p.get('markPrice', '?')} "
+                f"liq={p.get('liqPrice')} lev={p.get('leverage')}x "
+                f"margin={p.get('margin')} uPnL={p.get('unrealizedPNL')} "
+                f"mode={p.get('marginMode')}")
+        return "\n".join(lines)
+
+    async def cmd_orders(self) -> str:
+        from .trader.errors import BitunixAPIError
+        if not self._has_bitunix_keys():
+            return missing_keys_message()
+        try:
+            rows = await self.engine.client.get_pending_orders()
+        except BitunixAPIError as e:
+            return f"Bitunix error {e.code}: {e.msg or e}"
+        except Exception as e:  # noqa: BLE001
+            return f"orders request failed: {type(e).__name__}: {e}"
+        rows = rows or []
+        if not rows:
+            return "no pending orders"
+        lines = ["=== pending orders ==="]
+        for o in rows:
+            lines.append(f"{o.get('symbol')} {o.get('side')} {o.get('orderType')} "
+                         f"qty={o.get('qty')} price={o.get('price')} "
+                         f"status={o.get('status')} id={o.get('orderId')}")
+        return "\n".join(lines)
+
+    async def cmd_price(self, rest: str = "") -> str:
+        from .trader.errors import BitunixAPIError
+        syms = [x.strip().upper() for x in rest.replace(",", " ").split() if x.strip()]
+        syms = syms or list(self.s.symbols)
+        try:
+            data = await self.engine.client.get_tickers(",".join(syms))
+        except BitunixAPIError as e:
+            return f"Bitunix error {e.code}: {e.msg or e}"
+        except Exception as e:  # noqa: BLE001
+            return f"price request failed: {type(e).__name__}: {e}"
+        rows = data if isinstance(data, list) else [data] if data else []
+        if not rows:
+            return f"no ticker data for {','.join(syms)}"
+        lines = ["=== price ==="]
+        for t in rows:
+            lines.append(f"{t.get('symbol')} last={t.get('lastPrice')} "
+                         f"mark={t.get('markPrice')} high={t.get('high')} low={t.get('low')}")
+        return "\n".join(lines)
+
+    async def cmd_funding(self, rest: str = "") -> str:
+        from .trader.errors import BitunixAPIError
+        syms = [x.strip().upper() for x in rest.replace(",", " ").split() if x.strip()]
+        syms = syms or list(self.s.symbols)
+        try:
+            data = await self.engine.client.get_funding_rate_batch(",".join(syms))
+        except BitunixAPIError as e:
+            return f"Bitunix error {e.code}: {e.msg or e}"
+        except Exception as e:  # noqa: BLE001
+            return f"funding request failed: {type(e).__name__}: {e}"
+        rows = data if isinstance(data, list) else [data] if data else []
+        if not rows:
+            return f"no funding data for {','.join(syms)}"
+        lines = ["=== funding rate ==="]
+        for f in rows:
+            lines.append(f"{f.get('symbol')} rate={f.get('fundingRate')} "
+                         f"next={f.get('nextFundingTime', '?')}")
+        return "\n".join(lines)
+
+    async def cmd_leverage(self, rest: str = "") -> str:
+        from .trader.errors import BitunixAPIError
+        if not self._has_bitunix_keys():
+            return missing_keys_message()
+        syms = [x.strip().upper() for x in rest.replace(",", " ").split() if x.strip()]
+        syms = syms or list(self.s.symbols)
+        lines = ["=== leverage / margin mode ==="]
+        for sym in syms:
+            try:
+                d = await self.engine.client.get_leverage_and_margin_mode(sym)
+            except BitunixAPIError as e:
+                lines.append(f"{sym}: error {e.code}: {e.msg or e}")
+                continue
+            except Exception as e:  # noqa: BLE001
+                lines.append(f"{sym}: {type(e).__name__}: {e}")
+                continue
+            row = d[0] if isinstance(d, list) and d else (d or {})
+            lines.append(f"{sym}: leverage={row.get('leverage')}x "
+                         f"marginMode={row.get('marginMode')}")
+        return "\n".join(lines)
+
+    async def cmd_margin(self, rest: str = "") -> str:
+        return await self.cmd_leverage(rest)
+
+    async def cmd_pnl(self) -> str:
+        from .trader.errors import BitunixAPIError
+        if not self._has_bitunix_keys():
+            return missing_keys_message()
+        try:
+            d = await self.engine.pnl()
+        except BitunixAPIError as e:
+            return f"Bitunix error {e.code}: {e.msg or e}"
+        except Exception as e:  # noqa: BLE001
+            return f"pnl request failed: {type(e).__name__}: {e}"
+        lines = [f"unrealized total: {d.get('unrealized_total')}"]
+        for r in d.get("positions") or []:
+            lines.append(f"  {r.get('symbol')} {r.get('side')} "
+                         f"unrealized={r.get('unrealized')} realized={r.get('realized')}")
+        if not d.get("positions"):
+            lines.append("  (no open positions)")
+        return "\n".join(lines)
+
+    async def cmd_symbols(self, rest: str = "") -> str:
+        from .trader.errors import BitunixAPIError
+        try:
+            data = await self.engine.client.get_trading_pairs()
+        except BitunixAPIError as e:
+            return f"Bitunix error {e.code}: {e.msg or e}"
+        except Exception as e:  # noqa: BLE001
+            return f"symbols request failed: {type(e).__name__}: {e}"
+        rows = data if isinstance(data, list) else []
+        q = (rest or "").strip().upper()
+        if q:
+            rows = [r for r in rows if q in str(r.get("symbol", "")).upper()]
+        if not rows:
+            return f"no symbols matching {q!r}" if q else "no symbols returned"
+        lines = [f"{len(rows)} symbol(s)" + (f" matching {q}" if q else "") + ":"]
+        for r in rows[:60]:
+            lines.append(f"  {r.get('symbol'):<16} status={r.get('symbolStatus')} "
+                         f"maxLev={r.get('maxLeverage')} "
+                         f"basePrec={r.get('basePrecision')} "
+                         f"minVol={r.get('minTradeVolume')}")
+        if len(rows) > 60:
+            lines.append(f"  ... {len(rows) - 60} more")
         return "\n".join(lines)
 
     def cmd_memory(self, query: str) -> str:
