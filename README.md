@@ -35,6 +35,35 @@ python -m jrock.cli --help-cmds
 
 ---
 
+## Web dashboard
+
+`python -m jrock.web` serves the same agent in a browser instead of the terminal.
+Every line you submit goes through the same `JRockAgent.handle()` the CLI uses, so
+commands, natural language, and `yes`/`no` confirmations behave identically.
+
+```bash
+python -m jrock.web
+# J+Rock dashboard: http://127.0.0.1:8080/?token=...
+```
+
+Open the printed URL. The page has quick buttons for read-only queries and a box
+for any command or question.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `WEB_TOKEN` | *(random per start)* | Dashboard password. Sent as the `X-Auth-Token` header or `?token=` in the URL. Not an API key. |
+| `WEB_HOST` | `127.0.0.1` | Interface to listen on. Non-loopback addresses print a warning. |
+| `WEB_PORT` | `8080` | Port to listen on. |
+
+Set `WEB_TOKEN` in `.env` to keep the same password across restarts. Without it, a
+new random token is printed each time. Requests without a valid token get `401`.
+
+The dashboard binds to loopback by default. Do not expose it on a network interface
+without TLS and a reverse proxy in front. Autotrade and the engine loop are still
+never resumed automatically after a restart.
+
+---
+
 ## Commands
 
 ### Agent
@@ -171,6 +200,7 @@ jrock/
     model_selector.py    AutoSetModelByKey (list -> probe -> pick -> persist)
     agent.py             tools, self-healing, all 22 commands
     cli.py               interactive + --once + --startup
+    web.py               browser dashboard (aiohttp) over the same agent
     trader/
       client.py          REST client, double-SHA256 signing, 36 endpoints
       ws.py              public/private WS, auto-reconnect, signed login
