@@ -788,6 +788,92 @@ account tp pct 5             # ACCOUNT: ...or at +5% of available equity
 
 ---
 
+## The TP ladder — multi-level partial take-profit
+
+`PARTIAL` closes one fixed percentage at one threshold. The **ladder** replaces
+that with an ordered list of rungs, each closing a slice as the trade runs in
+its favour. It is a superset of `PARTIAL`: when a ladder is configured it owns
+the staged exits and the single-level partial is skipped, so the two can never
+both fire on the same pass.
+
+```
+TP_LADDER=1R:25,2R:25,3R:25
+```
+
+| Rung | Trigger | Closes | Remaining |
+|---|---|---|---|
+| 1 | 1R | 25% of the **original** | 75% |
+| 2 | 2R | 25% of the **original** | 50% |
+| 3 | 3R | 25% of the **original** | 25% |
+| runner | — | — | 25%, trails |
+
+### The rule that is easy to get wrong
+
+`close_pct` is a share of the **ORIGINAL** position size, never of the remaining
+size. For a 1000-unit position the rungs close 250 / 250 / 250 and leave 250.
+Compounding against the shrinking remainder would close 250 / 187.5 / 140.6 and
+leave 421.9 — a different trade. The arithmetic lives in one function
+(`ladder.level_qtys`) and is asserted directly by the tests.
+
+### Config
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `TP_LADDER` | *(empty)* | the spec; empty disables and falls back to `PARTIAL` |
+| `TP_LADDER_BREAKEVEN_AFTER` | `1` | which level moves the stop to breakeven; `0` disables |
+| `TP_LADDER_RUNNER` | `trail` | `trail` hands the remainder to the trailing stop, `close` closes it |
+| `TP_LADDER_TRIGGER_BASIS` | `R` | `R` (initial risk), `ROI` (percent), `PRICE` (absolute) |
+
+### Rules enforced in code, not just documented
+
+- **Sum ≤ 100.** A spec whose `close_pct` values exceed 100 is rejected with the
+  total named. Nothing is silently rescaled.
+- **Increasing triggers.** Out-of-order rungs are refused rather than sorted —
+  silently reordering a spec hides a typo.
+- **Each level fires exactly once.** `fired_levels` is persisted per position, so
+  a restart cannot re-fire a level that has already closed its slice.
+- **R uses the INITIAL risk.** Once the stop moves to breakeven, `|entry - sl|`
+  collapses to ~0; measuring R against the live stop would put every remaining
+  level on the entry price and fire them all at once. `initial_risk` is captured
+  at entry and persisted.
+- **Dust is closed, not orphaned.** If the remainder after a level would fall
+  below the symbol's `minTradeVolume` (read from the trading-pairs endpoint), the
+  remainder is closed with that level instead of leaving a position the exchange
+  will refuse to flatten later.
+- **One level per pass**, in order, so a fast move cannot skip a rung.
+
+### Commands
+
+```
+/ladder                          # the spec, fired levels per position, remaining qty
+ladder set 1R:25,2R:25,3R:25     # set it (validated; a bad spec changes nothing)
+ladder off                       # disable, fall back to single-level PARTIAL
+ladder breakeven 2               # move the stop after level 2
+ladder runner close              # close the remainder instead of trailing it
+ladder basis ROI                 # read triggers as ROI percent
+```
+
+### What each level sends
+
+Two documented calls per level:
+
+1. a reduce-only `MARKET` order for the level's slice —
+   `POST /api/v1/futures/trade/place_order` with `reduceOnly: true`, and
+2. `POST /api/v1/futures/tpsl/position/modify_order` for the **remaining**
+   quantity, so the stop left on the exchange matches what is still open.
+
+The level is only marked fired once the close has been accepted, so a rejected
+order is retried on the next pass rather than skipped.
+
+**Caveat, stated plainly:** the ladder is software. It only fires while the
+manage loop is running — the exchange knows nothing about the rungs. If the
+engine is down when a level's price is reached, that level fires on the next
+pass at the then-current price, not at the trigger.
+
+Verify: `python scripts/verify_tp_ladder.py`
+
+---
+
 ## The 4 TP/SL variants and the 3 order units
 
 ### The 4 TP/SL variants

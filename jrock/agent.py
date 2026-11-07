@@ -62,6 +62,9 @@ AGENT COMMANDS
   /price [SYMBOL]           last / mark price for your symbols
   /funding [SYMBOL]         current funding rate (or: /funding history SYMBOL)
   /tpsl                     the 4 TP/SL methods: show/set, pending, history, cancel
+  /ladder                   TP ladder: show levels, fired levels, remaining qty
+                            (ladder set 1R:25,2R:25,3R:25 | ladder off |
+                             ladder breakeven 2 | ladder runner trail|close)
   /batch                    batch-order status (orderList max 5, symbol required)
   /leverage                 leverage and margin mode per symbol
   /margin                   margin mode (ISOLATION|CROSS) per symbol
@@ -98,6 +101,9 @@ TRADER ENGINE COMMANDS
   partial close pct 50              partial at roi 50
   account tp usdt 100               account sl usdt 50
   account tp pct 5                  account sl pct 3
+  ladder set 1R:25,2R:25,3R:25      ladder off
+  ladder breakeven 2                ladder runner trail|close
+  ladder basis R|ROI|PRICE          ladder
   margin add BTCUSDT 100            margin reduce BTCUSDT 50
 
 PERMISSIONS
@@ -140,6 +146,7 @@ AGENT_BARE: dict[str, str] = {
     "price": "/price", "prices": "/price", "quote": "/price",
     "funding": "/funding", "funding_rate": "/funding",
     "tpsl": "/tpsl", "tp_sl": "/tpsl", "tpsl_method": "/tpsl",
+    "ladder": "/ladder", "tp_ladder": "/ladder",
     "batch": "/batch", "batch_order": "/batch",
     "leverage": "/leverage", "lev": "/leverage",
     "margin": "/margin", "margin_mode": "/margin",
@@ -160,7 +167,7 @@ FREE_TEXT_WORDS: tuple[str, ...] = (
 # engine syntax ("leverage 20"); bare they are a read ("leverage").
 QUERY_COMMANDS: frozenset[str] = frozenset({
     "/leverage", "/margin", "/symbols", "/price", "/funding", "/status", "/pnl",
-    "/tpsl", "/batch",
+    "/tpsl", "/batch", "/ladder",
 })
 
 # Natural-language intents we handle deterministically instead of guessing.
@@ -544,6 +551,8 @@ class JRockAgent:
             return await self.cmd_funding(rest)
         if cmd == "/tpsl":
             return await self.cmd_tpsl(rest)
+        if cmd == "/ladder":
+            return self.engine.ladder_report() if not rest else await self.engine.command(f"ladder {rest}")
         if cmd == "/batch":
             return await self.cmd_batch(rest)
         if cmd == "/leverage":

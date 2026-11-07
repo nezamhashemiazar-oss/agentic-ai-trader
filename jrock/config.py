@@ -135,6 +135,26 @@ class Settings:
     account_tp_pct: float = 0.0
     account_sl_pct: float = 0.0
 
+    # ---------------------------------------------------------------- TP ladder
+    #: Multi-level partial take-profit. An ordered list of rungs, each closing a
+    #: slice of the ORIGINAL position as the trade runs in its favour.
+    #:   "1R:25,2R:25,3R:25"  - close 25% at 1R, 25% at 2R, 25% at 3R
+    #:   "50:25,100:25"       - ROI percent (with TP_LADDER_TRIGGER_BASIS=ROI)
+    #:   "0.0055:25"          - an absolute price
+    #: Empty = disabled, which falls back to the single-level PARTIAL method.
+    #: close_pct is always a share of the ORIGINAL size, never of the remainder.
+    tp_ladder: str = ""
+    #: Which level moves the stop to breakeven. 1 = after the first level fills.
+    #: 0 disables the breakeven move.
+    tp_ladder_breakeven_after: int = 1
+    #: What to do with whatever is left after the last level:
+    #:   trail - hand it to the trailing stop (default)
+    #:   close - close it with the last level
+    tp_ladder_runner: str = "trail"
+    #: How a level's trigger is read: R (multiple of the initial risk), ROI
+    #: (percent) or PRICE (absolute).
+    tp_ladder_trigger_basis: str = "R"
+
     @property
     def data_dir(self) -> Path:
         p = ROOT / "data"
@@ -191,7 +211,27 @@ def load_settings(env_file: str | os.PathLike | None = None) -> Settings:
         max_margin_usdt=_f("MAX_MARGIN_USDT", 0.0),
         max_notional_usdt=_f("MAX_NOTIONAL_USDT", 0.0),
         max_memory_items=_i("MAX_MEMORY_ITEMS", 5000),
+        tp_ladder=os.getenv("TP_LADDER", "").strip(),
+        tp_ladder_breakeven_after=_i("TP_LADDER_BREAKEVEN_AFTER", 1),
+        tp_ladder_runner=_tp_ladder_runner(),
+        tp_ladder_trigger_basis=_tp_ladder_basis(),
     )
+
+
+def _tp_ladder_basis() -> str:
+    """TP_LADDER_TRIGGER_BASIS=R|ROI|PRICE, default R.
+
+    R is the basis the documented example spec uses ("1R:25,2R:25"), so an
+    unset or unrecognised value keeps it.
+    """
+    v = (os.getenv("TP_LADDER_TRIGGER_BASIS") or "R").strip().upper()
+    return v if v in ("R", "ROI", "PRICE") else "R"
+
+
+def _tp_ladder_runner() -> str:
+    """TP_LADDER_RUNNER=trail|close, default trail."""
+    v = (os.getenv("TP_LADDER_RUNNER") or "trail").strip().lower()
+    return v if v in ("trail", "close") else "trail"
 
 
 def _tp_sl_trigger_type() -> str:

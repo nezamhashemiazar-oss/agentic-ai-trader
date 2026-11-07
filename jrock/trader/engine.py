@@ -26,13 +26,16 @@ from .client import BitunixClient, BitunixConfig
 from .errors import BitunixAPIError
 from .indicators import atr, to_candles
 from .kline_cache import REST_KLINE_MAX, KlineCache
+from .ladder import (Ladder, LadderError, decide as ladder_decide,
+                     ladder_from_settings, level_qtys, parse_ladder,
+                     remaining_after, trigger_price_for)
 from .order_builder import (OrderValidationError, build_order_body,
                             debug_order_enabled, log_order_body)
 from .price_cache import PriceCache
 from .risk import (PairRules, Tier, TpSlSideError, clamp_sl, clamp_tp,
                    format_price, format_qty, margin_required, pick_tier,
                    position_size_by_risk, qty_from_notional, qty_from_unit,
-                   roi_pct, round_price, round_step, unit_from_qty,
+                   roi_pct, round_price, round_step, tick_size, unit_from_qty,
                    validate_tpsl_side)
 from .strategies import build_strategies
 from .tpsl import (PositionState, mid_management_action, next_trailing_stop,
@@ -78,6 +81,11 @@ class EngineState:
     account_sl_usdt: float = 0.0
     account_tp_pct: float = 0.0
     account_sl_pct: float = 0.0
+    # --- TP ladder (multi-level partial take-profit)
+    tp_ladder: str = ""
+    tp_ladder_breakeven_after: int = 1
+    tp_ladder_runner: str = "trail"
+    tp_ladder_trigger_basis: str = "R"
 
 
 class TraderEngine:
@@ -109,6 +117,10 @@ class TraderEngine:
             account_sl_usdt=settings.account_sl_usdt,
             account_tp_pct=settings.account_tp_pct,
             account_sl_pct=settings.account_sl_pct,
+            tp_ladder=settings.tp_ladder,
+            tp_ladder_breakeven_after=settings.tp_ladder_breakeven_after,
+            tp_ladder_runner=settings.tp_ladder_runner,
+            tp_ladder_trigger_basis=settings.tp_ladder_trigger_basis,
         )
         self.client = BitunixClient(BitunixConfig(
             api_key=settings.bitunix_api_key,
@@ -169,6 +181,8 @@ class TraderEngine:
         "scans",
         "tpsl_method", "partial_close_pct", "partial_at_roi_pct",
         "account_tp_usdt", "account_sl_usdt", "account_tp_pct", "account_sl_pct",
+        "tp_ladder", "tp_ladder_breakeven_after", "tp_ladder_runner",
+        "tp_ladder_trigger_basis",
     )
 
     def _state_snapshot(self) -> dict[str, Any]:
@@ -487,6 +501,14 @@ class TraderEngine:
                 "trailing_stop": st.trailing_stop,
                 "partial_done": st.partial_done,
                 "opened_ts": st.opened_ts, "peak_roi": st.peak_roi,
+                # Ladder state. `fired_levels` MUST persist: without it a
+                # restart re-fires a level that has already closed its slice,
+                # silently doubling the exit. `original_qty` must persist too,
+                # because close_pct is measured against it - restoring only the
+                # live qty would shrink every remaining level.
+                "fired_levels": st.fired_levels,
+                "original_qty": st.original_qty,
+                "initial_risk": st.initial_risk,
             }
         if body == self.store.section("positions"):
             return
@@ -725,6 +747,11 @@ class TraderEngine:
         if price <= 0:
             return {"ok": False, "reason": f"no price for {sym}"}
 
+        # Direction is resolved here because the mark-price fallback below
+        # needs it. Using it before assignment raised UnboundLocalError on the
+        # no-mark path.
+        side = "LONG" if agg.direction == "LONG" else "SHORT"
+
         # The exchange validates TP/SL against the MARK price, not the last
         # price. Fetch it so the plan is built on the same reference the
         # exchange will use. If it is unavailable we do NOT silently fall back
@@ -750,7 +777,6 @@ class TraderEngine:
             return {"ok": False, "reason": "no available balance"}
 
         tiers = await self.load_tiers(sym)
-        side = "LONG" if agg.direction == "LONG" else "SHORT"
 
         # The largest notional this account could open at the configured
         # leverage. Used for tier selection: a bigger notional lands in a
@@ -937,6 +963,15 @@ class TraderEngine:
                     leverage=int(p.get("leverage") or self.state.leverage),
                     sl=plan.sl, tp=plan.tp, liq=float(p.get("liqPrice") or plan.liq),
                     opened_ts=time.time(),
+                    # The ladder measures every close_pct against THIS number.
+                    # Captured once at entry: measuring against the live
+                    # (shrinking) qty would compound the exits.
+                    original_qty=float(p.get("qty") or qty),
+                    fired_levels=0,
+                    # The R basis is measured against the INITIAL risk. Once
+                    # the stop moves to breakeven, |entry - sl| collapses and
+                    # every remaining R level would fire at the entry price.
+                    initial_risk=abs(price - plan.sl),
                 )
                 break
         self.persist_positions()
@@ -990,6 +1025,159 @@ class TraderEngine:
             raise ValueError(
                 f"partial TP/SL for {sym}: no valid tp/sl price to attach")
         return await self.client.place_tp_sl_order(**body)
+
+    # ================================================================ TP ladder
+    def ladder(self) -> Ladder:
+        """The active ladder, parsed from the persisted spec.
+
+        Parsed on every read rather than cached: the spec is a single string in
+        the store, and a stale cached parse is one more thing that can disagree
+        with what `/ladder` shows.
+        """
+        return parse_ladder(
+            self.state.tp_ladder or "",
+            basis=self.state.tp_ladder_trigger_basis or "R",
+            breakeven_after=int(self.state.tp_ladder_breakeven_after or 0),
+            runner=self.state.tp_ladder_runner or "trail",
+        )
+
+    def _ladder_or_none(self) -> Ladder | None:
+        """The active ladder, or None when it is disabled or the spec is bad.
+
+        A bad spec must not stop the manage loop: it is recorded once and the
+        engine falls back to the single-level PARTIAL method.
+        """
+        try:
+            lad = self.ladder()
+        except LadderError as e:
+            msg = f"ladder: invalid spec: {e}"
+            if msg not in self.state.errors:
+                self.state.errors.append(msg)
+            return None
+        return lad if lad.levels else None
+
+    def ladder_report(self) -> str:
+        """`/ladder` - the spec, the fired levels per position, the remainder."""
+        try:
+            lad = self.ladder()
+        except LadderError as e:
+            return (f"TP ladder: INVALID - {e}\n"
+                    f"spec={self.state.tp_ladder!r} basis="
+                    f"{self.state.tp_ladder_trigger_basis}\n"
+                    f"The ladder is disabled until the spec is fixed; the "
+                    f"single-level PARTIAL method applies.")
+        lines = ["=== TP ladder ===", lad.describe()]
+        if not lad.levels:
+            lines.append("")
+            lines.append("Set one with:  ladder set 1R:25,2R:25,3R:25")
+            lines.append("Sub-settings:  ladder breakeven 2 | ladder runner close")
+            lines.append("Disable:       ladder off")
+            return "\n".join(lines)
+
+        lines.append(f"spec={lad.raw!r} basis={lad.basis} "
+                     f"breakeven_after={lad.breakeven_after} runner={lad.runner}")
+        lines.append("")
+        lines.append("levels:")
+        for i, lv in enumerate(lad.levels, start=1):
+            lines.append(f"  {i}. trigger {lv.trigger:g} ({lad.basis}) "
+                         f"-> close {lv.close_pct:g}% of the ORIGINAL size")
+        lines.append(f"  total {lad.total_pct:g}% closed, "
+                     f"{lad.runner_pct:g}% left for the runner ({lad.runner})")
+
+        if not self.positions:
+            lines.append("")
+            lines.append("no tracked positions - fired levels appear here once "
+                         "a position is open")
+            return "\n".join(lines)
+
+        lines.append("")
+        lines.append("open positions:")
+        for pid, st in self.positions.items():
+            rules = self.rules.get(st.symbol)
+            prec = rules.base_precision if rules else 0
+            orig = st.original_qty or st.qty
+            qtys = level_qtys(orig, lad, prec)
+            fired = max(0, min(st.fired_levels, len(lad.levels)))
+            rem = remaining_after(orig, lad, fired, prec)
+            lines.append(f"  {st.symbol} {st.side} id={pid} "
+                         f"original={orig:g} fired={fired}/{len(lad.levels)} "
+                         f"remaining={rem:g}")
+            for i, lv in enumerate(lad.levels):
+                mark = "x" if i < fired else " "
+                q = qtys[i] if i < len(qtys) else 0.0
+                trig = trigger_price_for(st.side, lv, basis=lad.basis,
+                                         entry=st.entry, sl=st.sl,
+                                         leverage=st.leverage,
+                                         initial_risk=st.initial_risk)
+                lines.append(f"    [{mark}] level {i + 1}: close {q:g} at "
+                             f"{trig:.{rules.quote_precision if rules else 6}f}")
+        return "\n".join(lines)
+
+    async def _ladder_fire(self, sym: str, pid: str, st: PositionState,
+                           rules: PairRules, decision, mark: float,
+                           trigger_type: str) -> dict | None:
+        """Close one ladder level and re-place the remainder's TP/SL.
+
+        Two documented calls per level:
+          1. a reduce-only MARKET order for the level's slice (the close), and
+          2. `modify_position_tp_sl_order` for the REMAINING quantity, so the
+             stop that is left on the exchange matches what is still open.
+
+        The level is only marked fired once the close has been accepted, so a
+        rejected order is retried on the next pass instead of being skipped.
+        """
+        qty = decision.fire_qty
+        if qty <= 0:
+            return None
+        close_side = "SELL" if st.side.upper() in ("LONG", "BUY") else "BUY"
+        try:
+            body = build_order_body(
+                symbol=sym, qty=qty, side=close_side, tradeSide="CLOSE",
+                positionId=pid, orderType="MARKET", reduceOnly=True,
+                rules=rules, known_symbols=set(self.rules) or None,
+            )
+            await self.client.place_order(**body)
+        except (BitunixAPIError, OrderValidationError, ValueError) as e:
+            self.state.errors.append(f"ladder {sym} level "
+                                     f"{decision.fire_index + 1}: {e}")
+            return None
+
+        st.fired_levels = decision.fire_index + 1
+        st.qty = max(0.0, round(st.qty - qty, 12))
+        self._log_trade({"event": "ladder_level", "ts": time.time(),
+                         "symbol": sym, "position_id": pid,
+                         "level": decision.fire_index + 1, "qty": qty,
+                         "remaining": st.qty, "price": mark})
+
+        # --- re-place the remainder's TP/SL with the REMAINING qty. The
+        # position TP/SL endpoint has no quantity field, so the remainder is
+        # expressed by the position itself; the standalone endpoint is used
+        # when a quantity must be stated explicitly.
+        remaining = st.qty
+        if remaining > 0 and rules.min_trade_volume > 0 \
+                and remaining < rules.min_trade_volume:
+            # Dust: the exchange would reject any attempt to close this later.
+            try:
+                await self.client.flash_close_position(pid)
+                st.qty = 0.0
+                self._log_trade({"event": "ladder_dust_close", "ts": time.time(),
+                                 "symbol": sym, "position_id": pid,
+                                 "qty": remaining})
+            except BitunixAPIError as e:
+                self.state.errors.append(f"ladder dust close {sym}: {e}")
+        elif remaining > 0:
+            try:
+                await self.client.modify_position_tp_sl_order(
+                    sym, pid,
+                    tp_price=format_price(st.tp, rules) if st.tp else None,
+                    sl_price=format_price(st.sl, rules) if st.sl else None,
+                    tp_stop_type=trigger_type, sl_stop_type=trigger_type)
+            except BitunixAPIError as e:
+                self.state.errors.append(f"ladder re-place {sym}: {e}")
+
+        return {"action": "ladder_level", "symbol": sym,
+                "level": decision.fire_index + 1, "qty": qty,
+                "remaining": st.qty, "reason": decision.reason}
 
     async def close_all_positions(self) -> dict:
         """Close every open position - the ACCOUNT TP/SL action.
@@ -1141,8 +1329,18 @@ class TraderEngine:
                     qty=float(p.get("qty") or 0), leverage=lev,
                     sl=0.0, tp=0.0, liq=float(p.get("liqPrice") or 0),
                     opened_ts=time.time(),
+                    original_qty=float(p.get("qty") or 0),
                 )
                 self.positions[pid] = st
+            # Backfill the ladder's reference values for a position that was
+            # restored from an older store (or first seen here) without them.
+            # Without this, initial_risk stays 0, the R basis falls back to
+            # |entry - sl|, and once the stop is at breakeven every remaining
+            # level fires at the entry price.
+            if st.original_qty <= 0:
+                st.original_qty = st.qty
+            if st.initial_risk <= 0 and st.sl > 0:
+                st.initial_risk = abs(entry - st.sl)
             st.peak_roi = max(st.peak_roi, roi)
 
             # The exchange validates every TP/SL trigger against the MARK price
@@ -1166,7 +1364,13 @@ class TraderEngine:
                 continue
 
             # 1) breakeven
-            if should_breakeven(st, roi, self.state.breakeven_pct):
+            #
+            # Skipped while a ladder is active: the ladder owns the breakeven
+            # move (TP_LADDER_BREAKEVEN_AFTER), and running both would send two
+            # identical modify calls on the same pass.
+            ladder_cfg = self._ladder_or_none()
+            ladder_owns_exits = bool(ladder_cfg and ladder_cfg.levels)
+            if not ladder_owns_exits and should_breakeven(st, roi, self.state.breakeven_pct):
                 sl = clamp_sl(side=side, sl=entry, entry=entry, mark=mark,
                               rules=rules, min_ticks=self.s.tpsl_min_stop_ticks,
                               liq=st.liq or None)
@@ -1215,6 +1419,77 @@ class TraderEngine:
                         except BitunixAPIError as e:
                             self.state.errors.append(f"trail {sym}: {e}")
 
+            # 2b) TP LADDER - multi-level partial take-profit.
+            #
+            # Runs BEFORE mid-management so a ladder level and the single-level
+            # partial can never both fire on the same pass (that would close
+            # two slices for one trigger). When a ladder is configured it OWNS
+            # the staged exits and the partial_close branch below is skipped.
+            ladder_active = False
+            lad = self._ladder_or_none()
+            if lad is not None:
+                ladder_active = True
+                orig = st.original_qty or st.qty
+                decision = ladder_decide(
+                    ladder=lad, side=side, entry=entry, sl=st.sl,
+                    leverage=st.leverage, price=price, original_qty=orig,
+                    fired=st.fired_levels, base_precision=rules.base_precision,
+                    min_trade_volume=rules.min_trade_volume,
+                    breakeven_done=st.breakeven_done,
+                    initial_risk=st.initial_risk)
+                if decision.fire_index is not None:
+                    res = await self._ladder_fire(sym, pid, st, rules, decision,
+                                                  mark, trigger_type)
+                    if res is not None:
+                        actions.append(res)
+                        self._log_tpsl({"event": "ladder_level", "ts": time.time(),
+                                        "symbol": sym, "position_id": pid,
+                                        "level": decision.fire_index + 1,
+                                        "qty": decision.fire_qty,
+                                        "remaining": st.qty,
+                                        "reason": decision.reason})
+                # breakeven after the configured level
+                if decision.move_breakeven and not st.breakeven_done:
+                    sl = clamp_sl(side=side, sl=entry, entry=entry, mark=mark,
+                                  rules=rules,
+                                  min_ticks=self.s.tpsl_min_stop_ticks,
+                                  liq=st.liq or None)
+                    # The trailing branch above may already have moved the stop
+                    # to this exact price on this pass. Sending the same modify
+                    # twice is a wasted round-trip and a second chance to be
+                    # rejected, so skip it and just record the state.
+                    if abs(sl - st.sl) <= (tick_size(rules) if rules else 0) / 2:
+                        st.breakeven_done = True
+                        st.sl = sl
+                    elif self._tpsl_side_ok(sym, side, entry, mark, sl, st.tp, rules):
+                        try:
+                            await self.client.modify_position_tp_sl_order(
+                                sym, pid,
+                                tp_price=format_price(st.tp, rules) if st.tp else None,
+                                sl_price=format_price(sl, rules),
+                                tp_stop_type=trigger_type,
+                                sl_stop_type=trigger_type)
+                            st.breakeven_done = True
+                            st.sl = sl
+                            actions.append({"action": "ladder_breakeven",
+                                            "symbol": sym, "sl": sl,
+                                            "after_level": decision.fire_index + 1})
+                            self._log_tpsl({"event": "ladder_breakeven",
+                                            "ts": time.time(), "symbol": sym,
+                                            "position_id": pid, "sl": sl})
+                        except BitunixAPIError as e:
+                            self.state.errors.append(f"ladder breakeven {sym}: {e}")
+                # runner handling once the ladder is exhausted
+                if decision.runner_close and st.qty > 0:
+                    res = await self.close_position(symbol=sym, position_id=pid)
+                    actions.append({"action": "ladder_runner_close", "symbol": sym,
+                                    "result": res})
+                elif decision.runner_trail:
+                    # Hand the remainder to the trailing stop. `trailing_active`
+                    # is what the trailing branch above keys off, so arming it
+                    # here is enough - the next pass ratchets the stop.
+                    st.trailing_active = True
+
             # 3) mid-management
             agg = self.last_aggregates.get(sym)
             reversal = bool(agg and agg.actionable and agg.direction != side)
@@ -1226,7 +1501,7 @@ class TraderEngine:
                 res = await self.close_position(symbol=sym, position_id=pid)
                 actions.append({"action": "close_reversal", "symbol": sym,
                                 "roi": round(roi, 2), "result": res})
-            elif action == "partial_close" and not st.partial_done:
+            elif action == "partial_close" and not st.partial_done and not ladder_active:
                 # PARTIAL TP/SL (method 2 of 4): close a DEFINED % of the
                 # position, leaving the rest open. When the engine is set to the
                 # PARTIAL method this goes through the native standalone TP/SL
@@ -1411,6 +1686,8 @@ class TraderEngine:
         # the four documented TP/SL methods
         "tpsl method", "partial close pct", "partial at roi",
         "account tp usdt", "account sl usdt", "account tp pct", "account sl pct",
+        # the TP ladder
+        "ladder",
     )
 
     def looks_like_command(self, line: str) -> bool:
@@ -1641,6 +1918,9 @@ class TraderEngine:
                 return f"Account SL = -{s.account_sl_pct:g}% of equity (0 disables)."
             except (ValueError, IndexError):
                 return "Usage: account sl pct 3"
+        # ------------------------------------------------------- the TP ladder
+        if low == "ladder" or low.startswith("ladder "):
+            return self._ladder_command(raw)
         if low.startswith("risk"):
             try:
                 s.risk_pct = float(arg("risk").split()[-1])
@@ -1649,6 +1929,80 @@ class TraderEngine:
                 return "Usage: risk 1.0"
 
         return f"Unknown engine command: {raw!r}. Type 'help' for the list."
+
+    def _ladder_command(self, raw: str) -> str:
+        """`ladder ...` - show, set, disable, and the two sub-settings.
+
+        Every setter validates BEFORE writing, so a bad spec leaves the previous
+        ladder in place rather than disabling staged exits by accident.
+        """
+        s = self.state
+        rest = raw.strip()[len("ladder"):].strip()
+        low = rest.lower()
+
+        if not rest:
+            return self.ladder_report()
+
+        if low in ("off", "none", "disable", "clear"):
+            s.tp_ladder = ""
+            return ("TP ladder OFF - the single-level PARTIAL method applies.\n"
+                    + self.ladder_report())
+
+        if low.startswith("breakeven"):
+            val = rest[len("breakeven"):].strip()
+            if not val:
+                return (f"Breakeven after level = {s.tp_ladder_breakeven_after} "
+                        f"(0 disables).\nUsage: ladder breakeven 2")
+            try:
+                n = int(val.split()[-1])
+            except (ValueError, IndexError):
+                return "Usage: ladder breakeven 2"
+            if n < 0:
+                return "Breakeven level must be >= 0 (0 disables the move)."
+            try:
+                lad = self.ladder()
+            except LadderError as e:
+                return f"Cannot set breakeven: the current ladder is invalid ({e})"
+            if lad.levels and n > len(lad.levels):
+                return (f"Breakeven level {n} is outside 0..{len(lad.levels)} "
+                        f"(the ladder has {len(lad.levels)} levels).")
+            s.tp_ladder_breakeven_after = n
+            return (f"Breakeven after level {n}."
+                    if n else "Breakeven move disabled.")
+
+        if low.startswith("runner"):
+            val = rest[len("runner"):].strip().lower()
+            if val not in ("trail", "close"):
+                return "Usage: ladder runner trail|close"
+            s.tp_ladder_runner = val
+            return (f"Runner = {val} "
+                    f"({'the remainder trails' if val == 'trail' else 'the remainder closes with the last level'}).")
+
+        if low.startswith("basis"):
+            val = rest[len("basis"):].strip().upper()
+            if val not in ("R", "ROI", "PRICE"):
+                return "Usage: ladder basis R|ROI|PRICE"
+            s.tp_ladder_trigger_basis = val
+            return f"Ladder trigger basis = {val}."
+
+        if low.startswith("set"):
+            spec = rest[len("set"):].strip()
+            if not spec:
+                return "Usage: ladder set 1R:25,2R:25,3R:25"
+            try:
+                lad = parse_ladder(
+                    spec, basis=s.tp_ladder_trigger_basis or "R",
+                    breakeven_after=int(s.tp_ladder_breakeven_after or 0),
+                    runner=s.tp_ladder_runner or "trail")
+            except LadderError as e:
+                # Nothing is written: the previous ladder stays active.
+                return f"Invalid ladder: {e}\nNothing changed."
+            s.tp_ladder = spec
+            return "TP ladder set.\n" + self.ladder_report()
+
+        return ("Usage: ladder | ladder set 1R:25,2R:25,3R:25 | ladder off | "
+                "ladder breakeven 2 | ladder runner trail|close | "
+                "ladder basis R|ROI|PRICE")
 
     async def status(self) -> str:
         s = self.state

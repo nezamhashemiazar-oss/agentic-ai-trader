@@ -160,6 +160,19 @@ class PositionState:
     partial_done: bool = False
     opened_ts: float = 0.0
     peak_roi: float = 0.0
+    #: TP-ladder rungs already filled for this position. Persisted, so a
+    #: restart cannot re-fire a level that has already closed its slice - the
+    #: single most damaging ladder bug, because it silently doubles the exit.
+    fired_levels: int = 0
+    #: The position size the ladder percentages are measured against. Captured
+    #: at entry and never recomputed: close_pct is a share of the ORIGINAL size,
+    #: so measuring against the live (shrinking) qty would compound the exits.
+    original_qty: float = 0.0
+    #: The INITIAL risk per unit, |entry - initial stop|, captured at entry.
+    #: The ladder's R basis must use this, not the live `sl`: once the stop
+    #: moves to breakeven, |entry - sl| collapses to ~0 and every remaining R
+    #: level would land on the entry price and fire immediately.
+    initial_risk: float = 0.0
 
 
 def should_breakeven(state: PositionState, roi: float, breakeven_pct: float) -> bool:
