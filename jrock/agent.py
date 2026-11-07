@@ -1350,12 +1350,45 @@ class JRockAgent:
         except Exception as e:  # noqa: BLE001
             lines.append(f"position mode: {type(e).__name__}: {e}")
 
+        # `settings trade` is the engine's "show engine settings" command, but
+        # the bare word `settings` also maps here, so `trade` arrives as a
+        # symbol token. Validate every requested symbol against the live
+        # trading-pairs list BEFORE calling the private endpoint: an unknown
+        # pair makes Bitunix return 20015 "This futures is not supported"
+        # (observed: `settings trade` -> 20015). Drop invalid tokens with a
+        # clear warning; if nothing valid remains, fall back to "all
+        # configured" (symbols omitted) instead of sending a bogus symbol.
         syms = [x.strip().upper() for x in rest.replace(",", " ").split() if x.strip()]
+        if syms:
+            try:
+                pairs = await self.engine.client.get_trading_pairs()
+                valid = {str(r.get("symbol", "")).upper()
+                         for r in (pairs if isinstance(pairs, list) else [])}
+            except BitunixAPIError as e:
+                lines.append(f"trading settings: could not validate symbols "
+                             f"(error {e.code}: {e.msg or e})")
+                return "\n".join(lines)
+            except Exception as e:  # noqa: BLE001
+                lines.append(f"trading settings: could not validate symbols "
+                             f"({type(e).__name__}: {e})")
+                return "\n".join(lines)
+            bad = [s for s in syms if s not in valid]
+            if bad:
+                lines.append(f"trading settings: skipping unknown symbol(s) "
+                             f"{', '.join(bad)} (not a tradable futures pair)")
+            syms = [s for s in syms if s in valid]
         try:
             data = await self.engine.client.get_trading_settings(
                 ",".join(syms) if syms else None)
         except BitunixAPIError as e:
-            lines.append(f"trading settings: error {e.code}: {e.msg or e}")
+            if e.code == 20015:
+                lines.append("trading settings: error 20015 - the requested "
+                             "symbol is not a tradable futures pair. Use "
+                             "`/symbols` to list valid pairs, or run "
+                             "`settings` with no symbol to see all configured "
+                             "settings.")
+            else:
+                lines.append(f"trading settings: error {e.code}: {e.msg or e}")
             return "\n".join(lines)
         except Exception as e:  # noqa: BLE001
             lines.append(f"trading settings: {type(e).__name__}: {e}")
