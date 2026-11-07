@@ -24,6 +24,7 @@ from .config import ROOT, Settings, load_settings
 from .empty_response import (budget_warning, diagnose_empty, render_empty)
 from .memory import MemoryStore
 from .model_selector import autoset_model, persist_model
+from . import nlu
 from .permissions import PermissionManager
 from .settings_store import mirror_env
 from .store import Store
@@ -40,6 +41,19 @@ HELP = """J+Rock commands
 ================
 Type /help or help or ? for this list.
 Anything that is not a command is sent to the model as natural language.
+
+NATURAL LANGUAGE (no commands needed)
+  Just say what you mean. These all work as plain sentences:
+    "show me my trading settings"     "what is my balance"
+    "show my positions"               "what are my open orders"
+    "what is my pnl"                  "show me the status"
+    "turn off autotrade"              "stop the engine"
+    "close my AKEUSDT position"       "set leverage to 5x"
+    "set risk to 2%"                  "why did the last order fail"
+    "what does TP_SL_MIN_STOP_TICKS do"
+  Anything that moves money (orders, leverage, risk, autotrade, engine) asks
+  for a 'yes' before it runs. An ambiguous sentence asks a question instead of
+  guessing. A sentence that is not understood still goes to the model.
 
 AGENT COMMANDS
   /help  help  ?            this list
@@ -330,6 +344,9 @@ class JRockAgent:
         self.model: str = self.s.model
         self.mcp_servers: dict[str, str] = {}
         self.skills: dict[str, str] = {}
+        # A destructive natural-language action waiting for a yes/no. Held in
+        # memory only: a pending order confirmation must not survive a restart.
+        self._pending_action: nlu.Intent | None = None
         self._load_registry()
 
     # ---------------------------------------------------------- persistence
@@ -609,13 +626,19 @@ class JRockAgent:
         """Route a line with no leading slash.
 
         Order:
-          1. bare word that names an agent command  -> agent dispatcher
-          2. known natural-language intent          -> handled deterministically
-          3. engine command grammar                 -> engine
-          4. anything else                          -> the model
+          1. a pending destructive action awaiting yes/no  -> confirm or cancel
+          2. bare word that names an agent command         -> agent dispatcher
+          3. known natural-language intent                 -> handled deterministically
+          4. engine command grammar                        -> engine
+          5. anything else                                 -> the model
         """
         low = raw.strip().lower()
         head = low.split()[0] if low.split() else ""
+
+        # 0) A destructive action is waiting for confirmation. This is checked
+        #    FIRST so that "yes" cannot be swallowed by any other rule.
+        if self._pending_action is not None:
+            return await self._resolve_pending(raw)
 
         # 1) bare agent command name
         if head in AGENT_BARE:
@@ -635,8 +658,152 @@ class JRockAgent:
         if self.engine.looks_like_command(raw):
             return await self.engine.command(raw)
 
-        # 4) free text -> the model
+        # 4) natural-language understanding: map a normal sentence onto the
+        #    SAME command the user could have typed. Only reached when the line
+        #    is not already a command, so existing behaviour cannot regress.
+        resolved = nlu.parse(raw)
+        if isinstance(resolved, nlu.Clarification):
+            return self._render_clarification(resolved)
+        if isinstance(resolved, nlu.Intent):
+            return await self._act_on_intent(resolved)
+
+        # 5) free text -> the model
         return await self.chat(raw)
+
+    # ------------------------------------------------- natural-language layer
+    def _render_clarification(self, c: nlu.Clarification) -> str:
+        lines = [c.question]
+        if c.options:
+            lines.append("  " + " | ".join(c.options))
+        return "\n".join(lines)
+
+    async def _act_on_intent(self, intent: nlu.Intent) -> str:
+        """Execute a resolved intent, gating anything that moves money.
+
+        A destructive intent is NOT executed here: it is stored and the user is
+        asked to confirm. Only an explicit yes runs it.
+        """
+        if intent.destructive:
+            self._pending_action = intent
+            return nlu.confirmation_prompt(intent)
+        return await self._run_intent(intent)
+
+    async def _run_intent(self, intent: nlu.Intent) -> str:
+        """Run a resolved intent through the existing handlers."""
+        # Pseudo-commands the NLU layer owns (no engine equivalent).
+        if intent.command == "__why_failed__":
+            return self._explain_last_error()
+        if intent.command.startswith("__explain__"):
+            return self._explain_setting(intent.command.split()[-1])
+        if intent.command.startswith("__place__"):
+            return await self._place_from_nlu(intent)
+        # Everything else is a real command string: reuse the existing router.
+        return await self.handle(intent.command)
+
+    async def _resolve_pending(self, raw: str) -> str:
+        """Answer a pending destructive action with yes/no."""
+        intent = self._pending_action
+        assert intent is not None
+        if nlu.is_confirm(raw):
+            self._pending_action = None
+            self.perms.audit.write("nlu_confirmed", command=intent.command,
+                                   intent=intent.name)
+            out = await self._run_intent(intent)
+            return f"confirmed: {intent.describe}\n{out}"
+        if nlu.is_cancel(raw):
+            self._pending_action = None
+            self.perms.audit.write("nlu_cancelled", command=intent.command,
+                                   intent=intent.name)
+            return f"cancelled: {intent.describe} - nothing was sent."
+        # Anything else: keep waiting, but do not silently drop the question.
+        return (f"Still waiting on: {intent.describe}\n"
+                f"Reply 'yes' to confirm or 'no' to cancel.\n"
+                f"(your message was: {raw!r})")
+
+    def _explain_last_error(self) -> str:
+        """Answer "why did the last order fail" from the engine's own state."""
+        errs = list(self.engine.state.errors)
+        if not errs:
+            return ("No errors recorded in this session. If an order was "
+                    "rejected, the engine logs it here - run 'status' to see "
+                    "the current error count.")
+        last = errs[-1]
+        lines = [f"last error ({len(errs)} total this session):", f"  {last}"]
+        hint = self._hint_for_error(last)
+        if hint:
+            lines.append(f"  -> {hint}")
+        if len(errs) > 1:
+            lines.append("recent errors:")
+            for e in errs[-5:-1]:
+                lines.append(f"  {e}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _hint_for_error(err: str) -> str:
+        """Map a known Bitunix code in an error string to an actionable hint."""
+        from .trader.errors import hint_for
+        m = re.search(r"\[?(\d{4,5})\]?", err)
+        if not m:
+            return ""
+        return hint_for(int(m.group(1)))
+
+    def _explain_setting(self, name: str) -> str:
+        """Explain a setting defined in THIS repo, from the repo itself.
+
+        The engine once answered "I have no access to the engine" for
+        TP_SL_MIN_STOP_TICKS, which is defined in jrock/config.py. That is
+        wrong: the value is right here.
+        """
+        name = name.upper()
+        s = self.s
+        if name == "TP_SL_MIN_STOP_TICKS":
+            ticks = s.tpsl_min_stop_ticks
+            return (
+                f"TP_SL_MIN_STOP_TICKS = {ticks}\n"
+                f"  Defined in jrock/config.py, enforced in tpsl.plan_tpsl() and\n"
+                f"  risk.clamp_sl()/clamp_tp().\n"
+                f"  It is the minimum gap, in PRICE TICKS, that a TP/SL must keep\n"
+                f"  from the reference (mark/entry) price. 1 tick = 10^-quotePrecision.\n"
+                f"  AKEUSDT has quotePrecision 6, so 1 tick = 0.000001.\n"
+                f"  Higher = safer against 30029/30031 but a wider stop.\n"
+                f"  Lower = tighter stop, more likely to be rejected by the exchange.\n"
+                f"  Set it in .env, e.g. TP_SL_MIN_STOP_TICKS=3")
+        if name == "TAKER_FEE_RATE":
+            return (
+                f"TAKER_FEE_RATE = {s.taker_fee_rate}\n"
+                f"  Defined in jrock/config.py. The taker fee reserved ON TOP of\n"
+                f"  margin when sizing, so an order never asks for more than the\n"
+                f"  balance can pay for (this is what caused 20003).\n"
+                f"  Default 0.0006 = 0.06% (VIP-0). Set it to your real tier.")
+        if name == "MARGIN_SAFETY_PCT":
+            return (
+                f"MARGIN_SAFETY_PCT = {s.margin_safety_pct}\n"
+                f"  Defined in jrock/config.py. Extra headroom, as a % of balance,\n"
+                f"  reserved when sizing so a price move between sizing and the\n"
+                f"  request landing cannot push the order over the balance.")
+        return f"I do not know a setting called {name}."
+
+    async def _place_from_nlu(self, intent: nlu.Intent) -> str:
+        """Place an order from a natural-language sentence.
+
+        The engine's own entry path (try_enter) is signal-driven and sizes from
+        risk. A direct "open long BTCUSDT" has no signal, so it is refused
+        rather than guessed: sizing an order from a sentence would be inventing
+        a position size, which is exactly the kind of guess this layer must not
+        make.
+        """
+        parts = intent.command.split()
+        sym = parts[1] if len(parts) > 1 else "?"
+        side = parts[2] if len(parts) > 2 else "?"
+        return (
+            f"I understood: open a {side} position on {sym}.\n"
+            f"I will not place it from a sentence alone - the engine sizes every\n"
+            f"order from a signal and your risk setting, and inventing a size here\n"
+            f"would be a guess with real money.\n"
+            f"Options:\n"
+            f"  - let the engine trade it: 'start trading' (autotrade on)\n"
+            f"  - see the current signal first: 'status' or 'report'\n"
+            f"  - the engine's own entry path is signal-driven by design.")
 
     async def cmd_use_free_model(self) -> str:
         """Act on "switch to free model": probe free models only and pin one."""

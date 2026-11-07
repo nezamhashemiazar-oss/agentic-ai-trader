@@ -293,12 +293,14 @@ empty answer.
 
 ## How a line is routed
 
-Every line you type goes through four steps, in this order:
+Every line you type goes through five steps, in this order:
 
-1. `/command` -> the agent command dispatcher
-2. a bare word that names an agent command (`balance`, `positions`, `help`, ...) -> the agent
-3. engine command grammar (`leverage 20`, `scan off`, `min agreeing strategies 3`) -> the engine
-4. anything else -> the model, as natural language
+1. a pending destructive action awaiting `yes`/`no` -> confirm or cancel
+2. `/command` -> the agent command dispatcher
+3. a bare word that names an agent command (`balance`, `positions`, `help`, ...) -> the agent
+4. engine command grammar (`leverage 20`, `scan off`, `min agreeing strategies 3`) -> the engine
+5. a natural-language sentence -> the intent layer (`jrock/nlu.py`)
+6. anything else -> the model, as natural language
 
 A word that is both a query and a setter is disambiguated by its arguments:
 `leverage` reads, `leverage 20` sets. `report` reads status, `report on` toggles
@@ -307,6 +309,49 @@ the engine report.
 **Trader words are never sent to the model.** `balance`, `bal`, `wallet`,
 `equity`, `funds`, `positions`, `orders`, `price`, `funding`, `leverage`,
 `margin`, `pnl`, `status`, `symbols`, `pairs`, `markets` all have real handlers.
+
+## Natural language (no commands needed)
+
+You do not have to type a command. A normal sentence is resolved to the **same
+command string** you could have typed, and handed to the existing router - the
+intent layer never re-implements a handler, it only decides *which* command a
+sentence means.
+
+| You type | It runs |
+|---|---|
+| `show me my trading settings` | `settings trade` |
+| `what is my balance` | `balance` |
+| `show my positions` | `positions` |
+| `what are my open orders` | `orders` |
+| `what is my pnl` | `pnl` |
+| `show me the status` | `status` |
+| `turn off autotrade` | `stop trading` |
+| `stop the engine` | `engine off` |
+| `close my AKEUSDT position` | `close position AKEUSDT` |
+| `set leverage to 5x` | `leverage 5` |
+| `set risk to 2%` | `risk 2.0` |
+| `why did the last order fail` | engine error log + the code's hint |
+| `what does TP_SL_MIN_STOP_TICKS do` | answered from `jrock/config.py` |
+
+**Safety.** Anything that moves money - opening or closing a position, changing
+leverage, risk, margin mode, position mode, autotrade, or the engine - is
+**not** executed on the first turn. The engine prints what it is about to do and
+waits for an explicit `yes`. `no` cancels. A pending action lives in memory only,
+so it cannot survive a restart.
+
+**Ambiguity asks.** `close my position` asks which symbol. `set my leverage`
+asks for the value. `open a position on BTCUSDT` asks long or short. A direct
+`open long BTCUSDT` is understood but **refused**: the engine sizes every order
+from a signal and your risk setting, and inventing a size from a sentence would
+be a guess with real money.
+
+**Free text still reaches the model.** A sentence the intent layer does not
+recognise falls through unchanged, so nothing that used to work stops working.
+
+**The engine answers about its own settings.** `TP_SL_MIN_STOP_TICKS`,
+`TAKER_FEE_RATE` and `MARGIN_SAFETY_PCT` are defined in `jrock/config.py`; a
+question about them is answered from the repo, with the live value. The engine
+never claims it cannot see its own code.
 
 ## Empty model responses
 
@@ -560,17 +605,19 @@ python scripts/verify_restart.py   # the same through the real agent command pat
 python -m pytest -q tests
 ```
 
-425 tests covering indicators, risk math, all 16 strategies (including empty and
+772 tests covering indicators, risk math, all 16 strategies (including empty and
 short-data inputs), aggregation rules, TP/SL planning and side validation
 (30020-30033), the **running-engine** TP/SL path (breakeven + trailing, the
 second 30029), the order-size pre-flight (20003, tier leverage caps, margin
 bounds), API-reference/client drift, model probing, request signing, CLI
-routing, the thinking-level system (levels, aliases, persistence, and the exact
-request parameter sent), the balance command, empty-model-response diagnosis,
-the order builder's per-field validation, the price and kline caches, the
-WebSocket layer, and the persistent store (round-trip, SIGKILL survival,
-precedence, atomicity, corruption recovery, schema migration, memory eviction,
-and the secret guard).
+routing, the **natural-language intent layer** (sentence -> command mapping,
+destructive-action confirmation, ambiguity clarification, and a regression
+guard proving every existing command string still routes identically), the
+thinking-level system (levels, aliases, persistence, and the exact request
+parameter sent), the balance command, empty-model-response diagnosis, the order
+builder's per-field validation, the price and kline caches, the WebSocket layer,
+and the persistent store (round-trip, SIGKILL survival, precedence, atomicity,
+corruption recovery, schema migration, memory eviction, and the secret guard).
 
 ---
 

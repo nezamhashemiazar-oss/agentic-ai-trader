@@ -107,9 +107,23 @@ def test_engine_state_actually_mutates(tmp_path):
 def test_free_text_goes_to_model_not_engine(tmp_path):
     a = _agent(tmp_path)
     a.s.api_key = ""          # no key -> chat() reports that, does not crash
-    out = _run(a.handle("why did my order fail yesterday?"))
+    out = _run(a.handle("write me a poem about trading"))
     assert "Unknown engine command" not in out
     assert "model" in out.lower()
+
+
+def test_why_did_my_order_fail_is_answered_from_the_engine(tmp_path):
+    """This used to fall through to the model. It is now a real intent.
+
+    The engine owns the error log, so it answers from its own state instead of
+    asking a model to guess. The old assertion ("goes to the model") encoded
+    the very behaviour the natural-language layer was added to fix.
+    """
+    a = _agent(tmp_path)
+    a.s.api_key = ""
+    out = _run(a.handle("why did my order fail yesterday?"))
+    assert "Unknown engine command" not in out
+    assert "no errors" in out.lower() or "error" in out.lower()
 
 
 def test_switch_to_free_model_is_understood(tmp_path):

@@ -88,6 +88,42 @@ def describe(code: int) -> str:
     return ERROR_CODES.get(code, f"Unknown error code {code}")
 
 
+#: What to DO about a code, not just what it means. `describe()` is the
+#: exchange's own wording; this is the engine's next action. Kept separate so
+#: the official table stays a faithful copy of the docs.
+ACTIONABLE_HINTS: dict[int, str] = {
+    20003: ("the order needs more margin than the account has. The engine now "
+            "reserves the taker fee on top of margin when sizing; if this still "
+            "fires, lower the leverage, lower risk_pct, or add funds."),
+    20005: "the leverage is outside the contract's allowed range - check maxLeverage in /symbols.",
+    20006: "close open orders/positions before changing leverage or margin mode.",
+    20009: "close the position before changing the position mode.",
+    20011: "this API key is not allowed to trade futures - check the key's permissions.",
+    20012: "this contract is not tradable on this account right now.",
+    20015: "the symbol is not a tradable futures pair - use /symbols to list valid pairs.",
+    30016: "the quantity is below the contract's minimum - check minTradeVolume in /symbols.",
+    30017: "the quantity is below the contract's minimum qty.",
+    30020: "TP is on the wrong side of the mark price for this direction.",
+    30021: "TP is on the wrong side of the mark price for this direction.",
+    30022: "SL is on the wrong side of the mark price for this direction.",
+    30023: "SL is on the wrong side of the mark price for this direction.",
+    30024: "SL is on the wrong side of the liquidation price.",
+    30025: "SL is on the wrong side of the liquidation price.",
+    30029: ("SL is above the mark price on a LONG. Raise TP_SL_MIN_STOP_TICKS "
+            "or check the stop distance - the engine clamps this in clamp_sl()."),
+    30031: ("SL is below the mark price on a SHORT. Raise TP_SL_MIN_STOP_TICKS "
+            "or check the stop distance - the engine clamps this in clamp_sl()."),
+    30033: "TP is on the wrong side of the mark price for this direction.",
+    30038: "the TP/SL amount exceeds the position size.",
+    30040: "futures trading is prohibited for this account - contact Bitunix support.",
+}
+
+
+def hint_for(code: int) -> str:
+    """The engine's actionable next step for a code ('' when unknown)."""
+    return ACTIONABLE_HINTS.get(code, "")
+
+
 class BitunixAPIError(Exception):
     def __init__(self, code: int, msg: str = "", data=None):
         self.code = code
