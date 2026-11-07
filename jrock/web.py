@@ -18,6 +18,7 @@ import asyncio
 import logging
 import os
 import secrets
+import socket
 import sys
 
 from aiohttp import web
@@ -163,6 +164,19 @@ def make_app(agent: JRockAgent, token: str) -> web.Application:
     return app
 
 
+def port_in_use(host: str, port: int) -> bool:
+    """True if we cannot bind host:port. Checked before the agent starts, so a
+    busy port does not leave the trading feed running with no dashboard."""
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    with socket.socket(family, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind((host, port))
+        except OSError:
+            return True
+    return False
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="jrock-web", description="J+Rock web dashboard")
     ap.add_argument("--host", default=os.getenv("WEB_HOST", "127.0.0.1"))
@@ -170,7 +184,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--env", help="path to .env")
     args = ap.parse_args(argv)
 
-    token = os.getenv("WEB_TOKEN") or secrets.token_urlsafe(24)
+    if port_in_use(args.host, args.port):
+        print(f"ERROR: {args.host}:{args.port} is already in use. Another dashboard "
+              "may still be running, or another app holds the port. Stop it, or set "
+              "WEB_PORT to a free port (e.g. WEB_PORT=8090 python -m jrock.web).",
+              file=sys.stderr)
+        return 1
+
+    # Hex only: no I/l or 0/O confusion when copying from a terminal.
+    token = os.getenv("WEB_TOKEN") or secrets.token_hex(16)
     if args.host not in LOOPBACK_HOSTS:
         print(f"WARNING: binding to {args.host}, which is reachable from the network. "
               "Use TLS and a reverse proxy.", file=sys.stderr)
