@@ -70,6 +70,8 @@ class Settings:
     # private (position/order/balance) login handshake has never been verified
     # against the real server, so we do not silently switch the engine onto it.
     market_data_source: str = "rest"
+    #: A cached WS price older than this is never used for a trading decision.
+    price_max_age_sec: float = 5.0
 
     @property
     def data_dir(self) -> Path:
@@ -117,6 +119,7 @@ def load_settings(env_file: str | os.PathLike | None = None) -> Settings:
         report_interval=_i("TRADE_REPORT_INTERVAL", 30),
         thinking_level=level_from_env(),
         market_data_source=_market_data_source(),
+        price_max_age_sec=_f("PRICE_MAX_AGE_SEC", 5.0),
     )
 
 

@@ -24,11 +24,13 @@ from .errors import BitunixAPIError
 from .indicators import atr, to_candles
 from .order_builder import (OrderValidationError, build_order_body,
                             debug_order_enabled, log_order_body)
+from .price_cache import PriceCache
 from .risk import (PairRules, Tier, position_size_by_risk, qty_from_notional,
                    roi_pct, round_price, round_step)
 from .strategies import build_strategies
 from .tpsl import (PositionState, mid_management_action, next_trailing_stop,
                    plan_tpsl, should_breakeven, should_trail)
+from .ws import MarketDataFeed, WSConfig
 
 log = logging.getLogger("jrock.engine")
 
@@ -97,6 +99,12 @@ class TraderEngine:
         self.last_aggregates: dict[str, Aggregate] = {}
         self._tasks: list[asyncio.Task] = []
         self._stop = asyncio.Event()
+        # --- market data: one cache, one optional WS feed, one REST counter
+        self.price_cache = PriceCache(max_age=settings.price_max_age_sec)
+        self.feed: MarketDataFeed | None = None
+        self.feed_error: str = ""
+        self.feed_started_at: float = 0.0
+        self.rest_price_calls: int = 0
         self.trades_path = self.data_dir / "trades.jsonl"
         self.tpsl_path = self.data_dir / "tpsl.jsonl"
         self.signals_path = self.data_dir / "signals.jsonl"
@@ -107,13 +115,120 @@ class TraderEngine:
     async def start(self) -> None:
         await self.client.start()
         self._stop.clear()
+        await self.start_feed()
 
     async def stop(self) -> None:
         self._stop.set()
         for t in self._tasks:
             t.cancel()
         self._tasks.clear()
+        await self.stop_feed()
         await self.client.close()
+
+    # ============================================================ market data
+    async def start_feed(self) -> None:
+        """Open the public WS feed when MARKET_DATA_SOURCE=ws.
+
+        With `rest` this returns immediately and NO socket is ever opened -
+        that is asserted by a test.
+        """
+        if self.s.market_data_source != "ws":
+            return
+        if self.feed is not None:
+            return
+        symbols = self._feed_symbols()
+        if not symbols:
+            return
+        cfg = WSConfig.from_settings(self.s)
+        self.feed = MarketDataFeed(cfg, symbols, self.state.timeframes,
+                                   cache=self.price_cache)
+        self.feed_started_at = time.time()
+        try:
+            await self.feed.start()
+            # Wait (bounded) for the handshake so the banner tells the truth
+            # instead of reporting "NOT connected" during a normal connect.
+            for _ in range(50):
+                if self.feed.ws.connected:
+                    break
+                await asyncio.sleep(0.1)
+        except Exception as e:  # noqa: BLE001
+            self.feed_error = f"{type(e).__name__}: {e}"
+            log.warning("ws feed failed to start: %s - falling back to REST", e)
+            self.feed = None
+
+    async def stop_feed(self) -> None:
+        if self.feed is not None:
+            try:
+                await self.feed.stop()
+            except Exception as e:  # noqa: BLE001
+                log.debug("ws feed stop: %s", e)
+            self.feed = None
+
+    def _feed_symbols(self) -> list[str]:
+        """Every symbol the engine needs a price for."""
+        out: list[str] = []
+        for s in list(self.state.symbols) + [p.symbol for p in self.positions.values()]:
+            u = (s or "").upper()
+            if u and u not in out:
+                out.append(u)
+        return out
+
+    def feed_connected(self) -> bool:
+        return bool(self.feed is not None and self.feed.ws.connected)
+
+    def market_data_report(self) -> str:
+        """One honest line for the banner and /status."""
+        src = self.s.market_data_source
+        if src != "ws":
+            return "rest (REST polling)"
+        if self.feed is None:
+            why = f" - {self.feed_error}" if self.feed_error else ""
+            return f"ws (NOT connected - falling back to REST{why})"
+        if not self.feed.ws.connected:
+            return "ws (NOT connected - falling back to REST)"
+        return f"ws (connected, {len(self.feed.symbols)} symbols)"
+
+    async def get_price(self, symbol: str) -> float:
+        """THE single price accessor. Every price read in the engine goes here.
+
+        ws mode:  fresh cache -> return it. Stale/missing -> REST fallback.
+        rest mode: straight to REST, exactly as before.
+        """
+        sym = (symbol or "").upper()
+        if self.s.market_data_source == "ws":
+            q = self.price_cache.get_fresh(sym)
+            if q is not None:
+                return q.price
+            age = self.price_cache.age(sym)
+            if age is None:
+                self.price_cache.note_miss()
+            else:
+                self.price_cache.note_stale()
+                log.warning("stale price for %s: %.1fs old (max %.1fs) - "
+                            "refusing it, falling back to REST", sym, age,
+                            self.price_cache.max_age)
+            self.price_cache.note_rest_fallback()
+        return await self._rest_price(sym)
+
+    async def _rest_price(self, symbol: str) -> float:
+        self.rest_price_calls += 1
+        data = await self.client.get_tickers(symbol)
+        if isinstance(data, list) and data:
+            d = data[0]
+        elif isinstance(data, dict):
+            d = data
+        else:
+            return 0.0
+        for k in ("lastPrice", "last", "price", "markPrice"):
+            if d.get(k):
+                try:
+                    px = float(d[k])
+                except (TypeError, ValueError):
+                    continue
+                if self.s.market_data_source == "ws":
+                    self.price_cache.put_rest(symbol, px)
+                return px
+        return 0.0
 
     def _spawn(self, coro, name: str) -> None:
         t = asyncio.create_task(coro, name=name)
@@ -161,22 +276,6 @@ class TraderEngine:
         except BitunixAPIError as e:
             self.state.errors.append(f"load_tiers {symbol}: {e}")
             return []
-
-    async def get_price(self, symbol: str) -> float:
-        data = await self.client.get_tickers(symbol)
-        if isinstance(data, list) and data:
-            d = data[0]
-        elif isinstance(data, dict):
-            d = data
-        else:
-            return 0.0
-        for k in ("lastPrice", "last", "price", "markPrice"):
-            if d.get(k):
-                try:
-                    return float(d[k])
-                except (TypeError, ValueError):
-                    continue
-        return 0.0
 
     async def get_candles(self, symbol: str, tf: str, limit: int = 300):
         raw = await self.client.get_kline(symbol, tf, limit=min(limit, 200))

@@ -391,6 +391,38 @@ onto WS by default would mean trusting an unverified auth path with real
 positions. Set `MARKET_DATA_SOURCE=ws` yourself once you have confirmed
 `/ws test` and a private login on your own keys.
 
+### Price cache - how `ws` actually replaces REST
+
+`MARKET_DATA_SOURCE=ws` is not a label. Every price read in the engine goes
+through one accessor, `TraderEngine.get_price(symbol)`, which consults a
+`PriceCache` fed by the public `price` and `ticker` channels.
+
+| Situation | What happens |
+|---|---|
+| cached quote younger than `PRICE_MAX_AGE_SEC` (default 5s) | returned, `source=ws`, **no REST call** |
+| no cached quote | REST fallback, counted as a `miss` |
+| cached quote older than the limit | **refused**, warning logged, REST fallback, counted as a `stale_rejection` |
+| WS disconnected | REST fallback; the engine keeps running, never blocks on the socket |
+| `MARKET_DATA_SOURCE=rest` | no cache consulted, **no socket opened at all** |
+
+Every quote carries its source, the exchange timestamp and our local receive
+time, so a stale price can never be used silently for a trading decision.
+
+`/ws` prints the cache counters (`hits`, `misses`, `stale_rejections`,
+`rest_fallbacks`, `ws_updates`, `rest_updates`) and the total REST price calls
+made, which is how you prove REST is actually bypassed.
+
+Live verification (`scripts/verify_ws_prices.py`, real feed):
+
+```
+Market data: ws (connected, 2 symbols)
+BTCUSDT: 75921.8 src=ws age=0.06s exchange_ts=1794010712.343
+20 get_price calls -> REST calls: 0
+feed stopped + cache cleared -> get_price = 75921.8 in 181ms, REST calls: 1
+injected stale price 1.0 -> refused (0.5s old, max 0.3s), REST fallback, price 75921.8
+pending asyncio tasks after stop: 0
+```
+
 ### Heartbeat detail
 
 The client sends `{"op":"ping","ping":<unix seconds>}` and the server answers

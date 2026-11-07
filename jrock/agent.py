@@ -277,6 +277,8 @@ class JRockAgent:
         self.engine.status_extra = lambda: [
             f"thinking={self.thinking_level}",
             f"market_data={self.s.market_data_source}",
+            f"market_data_state={self.engine.market_data_report()}",
+            f"price_cache={self._cache_line()}",
         ]
         self._ws_feed = None
         self.model: str = self.s.model
@@ -369,8 +371,14 @@ class JRockAgent:
         ok, msg = await self.engine.client.verify_credentials()
         lines.append(f"Bitunix: {'OK' if ok else 'FAIL'} - {msg}")
         lines.append(f"Thinking: {self.thinking_level}")
-        lines.append(f"Market data: {self.s.market_data_source}" + (
-            " (WebSocket)" if self.s.market_data_source == "ws" else " (REST polling)"))
+        # Start the feed BEFORE printing the banner, so the banner reports the
+        # real connection state instead of a guess.
+        if self.s.market_data_source == "ws":
+            await self.engine.start_feed()
+        lines.append(f"Market data: {self.engine.market_data_report()}")
+        if self.s.market_data_source == "ws" and not self.engine.feed_connected():
+            lines.append("  WARNING: MARKET_DATA_SOURCE=ws but the feed is NOT connected. "
+                         "The engine is running on REST fallback.")
         lines.append(f"Permissions: auto_accept_edit={self.perms.auto_accept_edit} "
                      f"device_access={self.perms.full_device_access}")
         return "\n".join(lines)
@@ -781,16 +789,19 @@ class JRockAgent:
             self.s.market_data_source = "ws" if arg == "on" else "rest"
             self.store.set("market_data_source", self.s.market_data_source)
             mirror_env(ROOT / ".env", "MARKET_DATA_SOURCE", self.s.market_data_source)
-            if arg == "off" and self._ws_feed is not None:
-                await self._ws_feed.stop()
-                self._ws_feed = None
+            if arg == "off":
+                await self.engine.stop_feed()
+            else:
+                await self.engine.start_feed()
             note = ""
             if arg == "on" and not self._has_bitunix_keys():
                 note = ("\nNote: no BITUNIX_API_KEY/SECRET set, so private channels "
                         "(position/order/balance) cannot authenticate. Public market "
                         "data works; the engine will fall back to REST for account state.")
+            state = self.engine.market_data_report()
             return (f"MARKET_DATA_SOURCE = {self.s.market_data_source}"
-                    f" (persisted to data/settings.json and .env){note}")
+                    f" (persisted to data/settings.json and .env)\n"
+                    f"feed: {state}{note}")
 
         if arg in ("test", "probe"):
             return await self._ws_test()
@@ -802,6 +813,14 @@ class JRockAgent:
                 "       /ws on|off     switch market data source\n"
                 "       /ws test       open a real connection and print 3 frames")
 
+    def _cache_line(self) -> str:
+        """Compact cache counters for /status."""
+        c = self.engine.price_cache
+        st = c.stats
+        return (f"hits={st.hits} misses={st.misses} stale={st.stale_rejections} "
+                f"rest_fallbacks={st.rest_fallbacks} ws_updates={st.ws_updates} "
+                f"rest_calls={self.engine.rest_price_calls}")
+
     def _ws_status(self) -> str:
         from .trader.ws import WSConfig, PUBLIC_CHANNELS, PRIVATE_CHANNELS
 
@@ -811,7 +830,7 @@ class JRockAgent:
                  f"private url = {self.s.bitunix_ws_private}",
                  f"credentials = {'present' if self._has_bitunix_keys() else 'MISSING'}"]
 
-        feed = self._ws_feed
+        feed = self.engine.feed
         if feed is None:
             lines.append("connection: not started (run /ws test to probe, /ws on to enable)")
         else:
@@ -821,15 +840,33 @@ class JRockAgent:
                 f"uptime: {st['uptime_s']}s   reconnects: {st['reconnects']}",
                 f"subscriptions: {st['subscriptions']}   messages: {st['messages']}   dropped: {st['dropped']}",
                 f"heartbeat: pings={st['pings_sent']} pongs={st['pongs_received']}",
-                f"last message: {st['last_message_age_s']}s ago",
+                ("last message: never" if st["last_message_age_s"] is None
+                 else f"last message: {st['last_message_age_s']}s ago"),
             ]
             if st["last_error"]:
                 lines.append(f"last error: {st['last_error']}")
             subs = ", ".join(f"{s['ch']}:{s.get('symbol','*')}" for s in feed.ws.subs[:12])
             lines.append(f"channels: {subs}")
 
+        # --- price cache: the part that decides whether WS actually replaces REST
+        c = self.engine.price_cache
+        cs = c.stats
+        lines += [
+            "",
+            "--- price cache ---",
+            f"max age: {c.max_age}s   symbols cached: {len(c.symbols())}",
+            f"hits={cs.hits}  misses={cs.misses}  stale_rejections={cs.stale_rejections}",
+            f"rest_fallbacks={cs.rest_fallbacks}  ws_updates={cs.ws_updates}  "
+            f"rest_updates={cs.rest_updates}",
+            f"REST price calls made: {self.engine.rest_price_calls}",
+        ]
+        for sym in c.symbols()[:8]:
+            q = c.peek(sym)
+            if q:
+                lines.append(f"  {sym}: {q.price} src={q.source} age={q.age():.1f}s")
+
         lines += ["", "public channels:  " + ", ".join(sorted(set(PUBLIC_CHANNELS.values()))),
-                  "private channels: " + ", ".join(sorted(PRIVATE_CHANNELS.values()))]
+                  "private channels: " + ", ".join(sorted(set(PRIVATE_CHANNELS.values())))]
         return "\n".join(lines)
 
     async def _ws_test(self) -> str:
@@ -940,6 +977,28 @@ class JRockAgent:
         from .trader.errors import BitunixAPIError
         syms = [x.strip().upper() for x in rest.replace(",", " ").split() if x.strip()]
         syms = syms or list(self.s.symbols)
+        if self.s.market_data_source == "ws":
+            # Same accessor the engine trades on: fresh cache, else REST.
+            # Give a just-connected feed a moment to deliver its first frame
+            # instead of reporting a REST fallback on a cold cache.
+            if self.engine.feed_connected():
+                for _ in range(20):
+                    if all(self.engine.price_cache.peek(s) for s in syms):
+                        break
+                    await asyncio.sleep(0.1)
+            lines = ["=== price (ws cache) ==="]
+            for sym in syms:
+                try:
+                    px = await self.engine.get_price(sym)
+                except BitunixAPIError as e:
+                    lines.append(f"{sym}: Bitunix error {e.code}: {e.msg or e}")
+                    continue
+                q = self.engine.price_cache.peek(sym)
+                if q is None:
+                    lines.append(f"{sym}: {px} (no cache entry)")
+                else:
+                    lines.append(f"{sym}: {px} src={q.source} age={q.age():.1f}s")
+            return "\n".join(lines)
         try:
             data = await self.engine.client.get_tickers(",".join(syms))
         except BitunixAPIError as e:

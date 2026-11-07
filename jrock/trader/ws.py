@@ -486,12 +486,16 @@ class BitunixWebSocket:
 # ---------------------------------------------------------------- feed
 
 class MarketDataFeed:
-    """One public WS for a set of symbols/timeframes, with a price cache."""
+    """One public WS for a set of symbols/timeframes, feeding a PriceCache."""
 
-    def __init__(self, cfg: WSConfig, symbols: list[str], timeframes: list[str]):
+    def __init__(self, cfg: WSConfig, symbols: list[str], timeframes: list[str],
+                 cache: "PriceCache | None" = None):
+        from .price_cache import PriceCache
+
         self.ws = BitunixWebSocket(cfg, private=False)
         self.symbols = [s.upper() for s in symbols]
         self.timeframes = list(timeframes)
+        self.cache = cache if cache is not None else PriceCache()
         self.latest_price: dict[str, float] = {}
         self.latest_mark: dict[str, float] = {}
         self.latest_funding: dict[str, float] = {}
@@ -518,7 +522,9 @@ class MarketDataFeed:
             return
         try:
             if d.get("mp"):
-                self.latest_price[sym] = float(d["mp"])
+                px = float(d["mp"])
+                self.latest_price[sym] = px
+                self.cache.put_ws(sym, px, exchange_ts=(ev.ts / 1000.0) if ev.ts else 0.0)
             if d.get("ip"):
                 self.latest_mark[sym] = float(d["ip"])
             if d.get("fr"):
@@ -532,7 +538,9 @@ class MarketDataFeed:
         px = d.get("la")
         if sym and px:
             try:
-                self.latest_price[sym] = float(px)
+                val = float(px)
+                self.latest_price[sym] = val
+                self.cache.put_ws(sym, val, exchange_ts=(ev.ts / 1000.0) if ev.ts else 0.0)
             except (TypeError, ValueError):
                 pass
 
