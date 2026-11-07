@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .errors import BitunixAPIError
-from .risk import PairRules, format_price, format_qty
+from .risk import PairRules, format_price, format_qty, validate_tpsl_side
 
 log = logging.getLogger("jrock.order_builder")
 
@@ -121,7 +121,10 @@ def build_order_body(*, symbol: str, qty: Any, side: str, orderType: str,
                      slPrice: Any = None, slStopType: str | None = None,
                      slOrderType: str | None = None, slOrderPrice: Any = None,
                      rules: PairRules | None = None,
-                     known_symbols: set[str] | None = None) -> dict[str, Any]:
+                     known_symbols: set[str] | None = None,
+                     mark_price: float | None = None,
+                     entry_price: float | None = None,
+                     min_stop_ticks: int = 3) -> dict[str, Any]:
     """Validate and build a place_order body. Raises OrderValidationError."""
     # --- symbol
     sym = _check_str(symbol, "symbol").upper()
@@ -237,6 +240,30 @@ def build_order_body(*, symbol: str, qty: Any, side: str, orderType: str,
     slPrice = _price_field(slPrice, "slPrice")
     tpOrderPrice = _price_field(tpOrderPrice, "tpOrderPrice")
     slOrderPrice = _price_field(slOrderPrice, "slOrderPrice")
+
+    # --- TP/SL must sit on the correct side of BOTH the mark price and the
+    # entry price. The exchange enforces this (30020-30033) and rejects the
+    # whole order, so refuse locally with the numbers instead of sending it.
+    if rules is not None and (tpPrice is not None or slPrice is not None):
+        ref_mark = mark_price if (mark_price is not None and mark_price > 0) else None
+        ref_entry = entry_price if (entry_price is not None and entry_price > 0) else None
+        if ref_mark is None and ref_entry is None:
+            raise OrderValidationError(
+                "cannot validate TP/SL: neither mark_price nor entry_price was "
+                "supplied, so the correct side is unknown. Pass mark_price.")
+        ref_mark = ref_mark if ref_mark is not None else ref_entry
+        ref_entry = ref_entry if ref_entry is not None else ref_mark
+        # BUY opens a long, SELL opens a short (tradeSide == OPEN).
+        direction = "LONG" if side == "BUY" else "SHORT"
+        violations = validate_tpsl_side(
+            symbol=sym, side=direction, entry=ref_entry, mark=ref_mark,
+            sl=float(slPrice) if slPrice is not None else None,
+            tp=float(tpPrice) if tpPrice is not None else None,
+            rules=rules, min_ticks=min_stop_ticks)
+        if violations:
+            raise OrderValidationError(
+                "TP/SL on the wrong side of the price - the exchange would "
+                "reject this order:\n  " + "\n  ".join(violations))
 
     spec = OrderSpec(
         symbol=sym, qty=qty_s, side=side, tradeSide=tradeSide, orderType=orderType,

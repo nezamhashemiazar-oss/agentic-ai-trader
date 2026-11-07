@@ -140,7 +140,8 @@ def test_tp_sl_strings_and_stop_types():
                             tpPrice="61000", tpStopType="mark_price",
                             tpOrderType="market", slPrice="59000",
                             slStopType="mark_price", slOrderType="market",
-                            rules=BTC, known_symbols={"BTCUSDT"})
+                            rules=BTC, known_symbols={"BTCUSDT"},
+                            mark_price=60000, entry_price=60000)
     assert body["tpStopType"] == "MARK_PRICE"
     assert body["slStopType"] == "MARK_PRICE"
     assert body["tpOrderType"] == "MARKET"
@@ -154,7 +155,8 @@ def test_tp_sl_prices_are_strings():
                             tpPrice=0.013961, slPrice=0.011752,
                             tpStopType="MARK_PRICE", tpOrderType="MARKET",
                             slStopType="MARK_PRICE", slOrderType="MARKET",
-                            rules=AKE, known_symbols={"AKEUSDT"})
+                            rules=AKE, known_symbols={"AKEUSDT"},
+                            mark_price=0.0128, entry_price=0.0128)
     assert isinstance(body["tpPrice"], str)
     assert isinstance(body["slPrice"], str)
     assert body["tpPrice"] == "0.013961"   # quotePrecision 6

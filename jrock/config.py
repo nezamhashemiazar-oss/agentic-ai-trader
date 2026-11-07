@@ -78,6 +78,16 @@ class Settings:
     kline_max_age_mult: float = 2.0
     #: Hard cap on candles held per (symbol, interval). Bounded, never unbounded.
     kline_cache_max: int = 500
+    #: Minimum distance a TP/SL must keep from the mark/entry price, in ticks
+    #: (1 tick = 10^-quotePrecision). Prevents rounding from collapsing a stop
+    #: onto the mark price, which the exchange rejects with 30029/30031.
+    tpsl_min_stop_ticks: int = 3
+    #: Order-size bounds, in USDT. 0 disables the bound. These are the engine's
+    #: OWN limits, checked before the request is sent; the exchange has its own
+    #: (minTradeVolume / maxMarketOrderVolume) which are enforced separately.
+    min_margin_usdt: float = 0.0
+    max_margin_usdt: float = 0.0
+    max_notional_usdt: float = 0.0
 
     @property
     def data_dir(self) -> Path:
@@ -128,6 +138,10 @@ def load_settings(env_file: str | os.PathLike | None = None) -> Settings:
         price_max_age_sec=_f("PRICE_MAX_AGE_SEC", 5.0),
         kline_max_age_mult=_f("KLINE_MAX_AGE_SEC", 2.0),
         kline_cache_max=_i("KLINE_CACHE_MAX", 500),
+        tpsl_min_stop_ticks=_i("TP_SL_MIN_STOP_TICKS", 3),
+        min_margin_usdt=_f("MIN_MARGIN_USDT", 0.0),
+        max_margin_usdt=_f("MAX_MARGIN_USDT", 0.0),
+        max_notional_usdt=_f("MAX_NOTIONAL_USDT", 0.0),
         max_memory_items=_i("MAX_MEMORY_ITEMS", 5000),
     )
 

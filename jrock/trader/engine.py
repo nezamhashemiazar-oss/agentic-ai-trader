@@ -27,7 +27,8 @@ from .kline_cache import REST_KLINE_MAX, KlineCache
 from .order_builder import (OrderValidationError, build_order_body,
                             debug_order_enabled, log_order_body)
 from .price_cache import PriceCache
-from .risk import (PairRules, Tier, position_size_by_risk, qty_from_notional,
+from .risk import (PairRules, Tier, TpSlSideError, margin_required,
+                   pick_tier, position_size_by_risk, qty_from_notional,
                    roi_pct, round_price, round_step)
 from .strategies import build_strategies
 from .tpsl import (PositionState, mid_management_action, next_trailing_stop,
@@ -342,6 +343,34 @@ class TraderEngine:
                 return px
         return 0.0
 
+    async def get_mark_price(self, symbol: str) -> float:
+        """The exchange MARK price, used to validate TP/SL placement.
+
+        This is deliberately separate from `get_price()`: the engine trades on
+        the last price, but Bitunix validates TP/SL triggers against the mark
+        price (errors 30020-30033). Using the last price for that check lets a
+        stop pass locally and be rejected by the exchange.
+        """
+        sym = (symbol or "").upper()
+        try:
+            data = await self.client.get_tickers(sym)
+        except BitunixAPIError as e:
+            self.state.errors.append(f"mark_price {sym}: {e}")
+            return 0.0
+        if isinstance(data, list) and data:
+            d = data[0]
+        elif isinstance(data, dict):
+            d = data
+        else:
+            return 0.0
+        for k in ("markPrice", "mark"):
+            if d.get(k):
+                try:
+                    return float(d[k])
+                except (TypeError, ValueError):
+                    continue
+        return 0.0
+
     def persist_positions(self) -> None:
         """Mirror the in-memory position-management state to the store.
 
@@ -600,6 +629,15 @@ class TraderEngine:
         if price <= 0:
             return {"ok": False, "reason": f"no price for {sym}"}
 
+        # The exchange validates TP/SL against the MARK price, not the last
+        # price. Fetch it so the plan is built on the same reference the
+        # exchange will use; fall back to the last price if it is unavailable.
+        mark = await self.get_mark_price(sym)
+        if mark <= 0:
+            mark = price
+            log.warning("no mark price for %s - validating TP/SL against the "
+                        "last price %s", sym, price)
+
         # account equity
         try:
             acct = await self.client.get_single_account()
@@ -613,30 +651,94 @@ class TraderEngine:
         tiers = await self.load_tiers(sym)
         side = "LONG" if agg.direction == "LONG" else "SHORT"
 
-        # provisional notional for tier selection, then plan TP/SL
-        notional = equity * self.state.leverage * (self.state.risk_pct / 100.0) * 10
-        plan = plan_tpsl(
-            side=side, entry=price, leverage=self.state.leverage, notional=notional,
-            strength=agg.strength, confidence=agg.confidence, tiers=tiers, rules=rules,
-            liq_sl_distance_pct=self.state.liq_sl_distance_pct,
-            breakeven_pct=self.state.breakeven_pct,
-            trailing_trigger_roi_pct=self.state.trailing_trigger_roi_pct,
-        )
+        # The largest notional this account could open at the configured
+        # leverage. Used for tier selection: a bigger notional lands in a
+        # higher tier with a higher maintenance-margin rate, so this is the
+        # conservative choice for the liquidation estimate.
+        max_notional = equity * self.state.leverage
+
+        # The tier for that notional band CAPS the leverage. Check it BEFORE
+        # planning: if the leverage is not allowed there is no valid plan, and
+        # the exchange would answer 20003 (it wants more margin than we
+        # computed) rather than a leverage error.
+        tier = pick_tier(tiers, max_notional)
+        if self.state.leverage > tier.leverage:
+            msg = (f"leverage {self.state.leverage}x exceeds the maximum "
+                   f"{tier.leverage}x allowed for a {max_notional:.2f} USDT "
+                   f"position on {sym} (risk tier {tier.level}). The exchange "
+                   f"would require "
+                   f"{margin_required(max_notional, tier.leverage):.4f} USDT "
+                   f"margin, not {margin_required(max_notional, self.state.leverage):.4f}. "
+                   f"Lower the leverage or reduce the position size.")
+            self.state.errors.append(f"preflight {sym}: {msg}")
+            return {"ok": False, "reason": msg, "hint": "20003 Insufficient balance"}
+
+        try:
+            plan = plan_tpsl(
+                side=side, entry=price, leverage=self.state.leverage,
+                notional=max_notional,
+                strength=agg.strength, confidence=agg.confidence, tiers=tiers, rules=rules,
+                liq_sl_distance_pct=self.state.liq_sl_distance_pct,
+                breakeven_pct=self.state.breakeven_pct,
+                trailing_trigger_roi_pct=self.state.trailing_trigger_roi_pct,
+                mark=mark, min_stop_ticks=self.s.tpsl_min_stop_ticks,
+            )
+        except TpSlSideError as e:
+            self.state.errors.append(f"tpsl {sym}: {e}")
+            return {"ok": False, "reason": f"cannot place a valid stop-loss: {e}"}
 
         qty = position_size_by_risk(equity, self.state.risk_pct, price, plan.sl,
                                     self.state.leverage, rules)
         if qty <= 0:
             return {"ok": False, "reason": "computed qty is 0 (risk too small or below min volume)"}
 
+        # --- pre-flight: the required margin must fit the real available
+        # balance, and the engine's own bounds. Without this the request is
+        # sent and the exchange answers 20003 Insufficient balance.
+        notional_real = qty * price
+        margin_real = margin_required(notional_real, self.state.leverage)
+
+        if margin_real > equity:
+            msg = (f"required margin {margin_real:.4f} USDT exceeds available "
+                   f"balance {equity:.4f} USDT for {sym} "
+                   f"(qty={qty}, notional={notional_real:.4f}, "
+                   f"leverage={self.state.leverage}x). "
+                   f"Lower the leverage, lower risk_pct, or add funds.")
+            self.state.errors.append(f"preflight {sym}: {msg}")
+            return {"ok": False, "reason": msg, "hint": "20003 Insufficient balance"}
+        if self.s.min_margin_usdt and margin_real < self.s.min_margin_usdt:
+            msg = (f"required margin {margin_real:.4f} USDT is below the configured "
+                   f"MIN_MARGIN_USDT={self.s.min_margin_usdt} for {sym} "
+                   f"(qty={qty}, notional={notional_real:.4f}).")
+            self.state.errors.append(f"preflight {sym}: {msg}")
+            return {"ok": False, "reason": msg}
+        if self.s.max_margin_usdt and margin_real > self.s.max_margin_usdt:
+            msg = (f"required margin {margin_real:.4f} USDT exceeds the configured "
+                   f"MAX_MARGIN_USDT={self.s.max_margin_usdt} for {sym} "
+                   f"(qty={qty}, notional={notional_real:.4f}).")
+            self.state.errors.append(f"preflight {sym}: {msg}")
+            return {"ok": False, "reason": msg}
+        if self.s.max_notional_usdt and notional_real > self.s.max_notional_usdt:
+            msg = (f"notional {notional_real:.4f} USDT exceeds the configured "
+                   f"MAX_NOTIONAL_USDT={self.s.max_notional_usdt} for {sym} "
+                   f"(qty={qty}, margin={margin_real:.4f}).")
+            self.state.errors.append(f"preflight {sym}: {msg}")
+            return {"ok": False, "reason": msg}
+
         # re-plan with the real notional
-        plan = plan_tpsl(
-            side=side, entry=price, leverage=self.state.leverage,
-            notional=qty * price, strength=agg.strength, confidence=agg.confidence,
-            tiers=tiers, rules=rules,
-            liq_sl_distance_pct=self.state.liq_sl_distance_pct,
-            breakeven_pct=self.state.breakeven_pct,
-            trailing_trigger_roi_pct=self.state.trailing_trigger_roi_pct,
-        )
+        try:
+            plan = plan_tpsl(
+                side=side, entry=price, leverage=self.state.leverage,
+                notional=qty * price, strength=agg.strength, confidence=agg.confidence,
+                tiers=tiers, rules=rules,
+                liq_sl_distance_pct=self.state.liq_sl_distance_pct,
+                breakeven_pct=self.state.breakeven_pct,
+                trailing_trigger_roi_pct=self.state.trailing_trigger_roi_pct,
+                mark=mark, min_stop_ticks=self.s.tpsl_min_stop_ticks,
+            )
+        except TpSlSideError as e:
+            self.state.errors.append(f"tpsl {sym}: {e}")
+            return {"ok": False, "reason": f"cannot place a valid stop-loss: {e}"}
 
         # ensure leverage / margin mode
         try:
@@ -658,6 +760,8 @@ class TraderEngine:
                 tpPrice=plan.tp, tpStopType="MARK_PRICE", tpOrderType="MARKET",
                 slPrice=plan.sl, slStopType="MARK_PRICE", slOrderType="MARKET",
                 rules=rules, known_symbols=set(self.rules) or None,
+                mark_price=mark, entry_price=price,
+                min_stop_ticks=self.s.tpsl_min_stop_ticks,
             )
         except OrderValidationError as e:
             self.state.errors.append(f"order validation {sym}: {e}")

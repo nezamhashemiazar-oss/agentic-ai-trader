@@ -194,6 +194,111 @@ def position_size_by_risk(equity: float, risk_pct: float, entry: float,
     return qty
 
 
+class TpSlSideError(ValueError):
+    """Raised when a TP/SL price cannot be placed on the correct side.
+
+    Bitunix rejects these with 30020-30033 (wrong side of mark/last price) and
+    30024/30025 (wrong side of the liquidation price). We refuse locally with
+    the numbers instead of sending a request we know will be rejected.
+    """
+
+
+def tick_size(rules: "PairRules") -> float:
+    """Smallest representable price step for the symbol (quotePrecision)."""
+    return 10.0 ** (-max(0, int(rules.quote_precision)))
+
+
+def min_stop_distance(rules: "PairRules", min_ticks: int = 3) -> float:
+    """Minimum distance a TP/SL must keep from the reference price.
+
+    Without this, a high-leverage stop can round onto (or past) the mark price
+    and the exchange rejects it with 30029/30031. `min_ticks` is configurable
+    via TP_SL_MIN_STOP_TICKS.
+    """
+    return tick_size(rules) * max(1, int(min_ticks))
+
+
+def tpsl_bounds(*, side: str, entry: float, mark: float,
+                rules: "PairRules", min_ticks: int = 3) -> tuple[float, float]:
+    """(lowest allowed SL, highest allowed SL) for the direction.
+
+    The exchange compares the trigger against BOTH the mark price and the
+    average entry price, so the stop must clear the worse of the two:
+
+        LONG : sl < min(entry, mark) - min_dist
+        SHORT: sl > max(entry, mark) + min_dist
+    """
+    d = min_stop_distance(rules, min_ticks)
+    if side.upper() in ("LONG", "BUY"):
+        return 0.0, min(entry, mark) - d
+    return max(entry, mark) + d, float("inf")
+
+
+def validate_tpsl_side(*, symbol: str, side: str, entry: float, mark: float,
+                       sl: float | None, tp: float | None,
+                       rules: "PairRules", min_ticks: int = 3,
+                       liq: float | None = None) -> list[str]:
+    """Return a list of human-readable violations (empty == valid).
+
+    Covers the documented exchange rules:
+        30020/30021  TP on the wrong side of mark
+        30022/30023  SL on the wrong side of mark
+        30026-30033  TP/SL on the wrong side of last price
+        30024/30025  SL on the wrong side of the liquidation price
+    """
+    is_long = side.upper() in ("LONG", "BUY")
+    d = min_stop_distance(rules, min_ticks)
+    out: list[str] = []
+
+    if sl is not None:
+        if is_long:
+            limit = min(entry, mark) - d
+            if sl >= limit:
+                out.append(
+                    f"SL {sl:.{rules.quote_precision}f} must be BELOW "
+                    f"{limit:.{rules.quote_precision}f} for a LONG "
+                    f"(entry={entry:.{rules.quote_precision}f}, "
+                    f"mark={mark:.{rules.quote_precision}f}, "
+                    f"min distance={d:.{rules.quote_precision}f})")
+            if liq is not None and sl <= liq:
+                out.append(
+                    f"SL {sl:.{rules.quote_precision}f} must be ABOVE the "
+                    f"liquidation price {liq:.{rules.quote_precision}f} for a LONG")
+        else:
+            limit = max(entry, mark) + d
+            if sl <= limit:
+                out.append(
+                    f"SL {sl:.{rules.quote_precision}f} must be ABOVE "
+                    f"{limit:.{rules.quote_precision}f} for a SHORT "
+                    f"(entry={entry:.{rules.quote_precision}f}, "
+                    f"mark={mark:.{rules.quote_precision}f}, "
+                    f"min distance={d:.{rules.quote_precision}f})")
+            if liq is not None and sl >= liq:
+                out.append(
+                    f"SL {sl:.{rules.quote_precision}f} must be BELOW the "
+                    f"liquidation price {liq:.{rules.quote_precision}f} for a SHORT")
+
+    if tp is not None:
+        if is_long:
+            limit = max(entry, mark) + d
+            if tp <= limit:
+                out.append(
+                    f"TP {tp:.{rules.quote_precision}f} must be ABOVE "
+                    f"{limit:.{rules.quote_precision}f} for a LONG "
+                    f"(entry={entry:.{rules.quote_precision}f}, "
+                    f"mark={mark:.{rules.quote_precision}f})")
+        else:
+            limit = min(entry, mark) - d
+            if tp >= limit:
+                out.append(
+                    f"TP {tp:.{rules.quote_precision}f} must be BELOW "
+                    f"{limit:.{rules.quote_precision}f} for a SHORT "
+                    f"(entry={entry:.{rules.quote_precision}f}, "
+                    f"mark={mark:.{rules.quote_precision}f})")
+
+    return [f"{symbol} {side.upper()}: {m}" for m in out]
+
+
 def validate_price_protection(price: float, mark: float, side: str,
                               scope: float) -> tuple[bool, str]:
     """Bitunix rejects orders outside the price-protection band."""

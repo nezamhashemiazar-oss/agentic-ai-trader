@@ -559,14 +559,66 @@ python scripts/verify_restart.py   # the same through the real agent command pat
 python -m pytest -q tests
 ```
 
-344 tests covering indicators, risk math, all 16 strategies (including empty and
-short-data inputs), aggregation rules, TP/SL planning, API-reference/client
-drift, model probing, request signing, CLI routing, the thinking-level system
-(levels, aliases, persistence, and the exact request parameter sent), the
-balance command, empty-model-response diagnosis, the order builder's per-field
-validation, the price and kline caches, the WebSocket layer, and the persistent
-store (round-trip, SIGKILL survival, precedence, atomicity, corruption
-recovery, schema migration, memory eviction, and the secret guard).
+391 tests covering indicators, risk math, all 16 strategies (including empty and
+short-data inputs), aggregation rules, TP/SL planning and side validation
+(30020-30033), the order-size pre-flight (20003, tier leverage caps, margin
+bounds), API-reference/client drift, model probing, request signing, CLI
+routing, the thinking-level system (levels, aliases, persistence, and the exact
+request parameter sent), the balance command, empty-model-response diagnosis,
+the order builder's per-field validation, the price and kline caches, the
+WebSocket layer, and the persistent store (round-trip, SIGKILL survival,
+precedence, atomicity, corruption recovery, schema migration, memory eviction,
+and the secret guard).
+
+---
+
+## Order pre-flight: why 20003 and 30029 no longer reach the exchange
+
+Two exchange rejections were traced to the engine sending requests it could
+have refused locally.
+
+### 30029 `SL price must be less than mark price`
+
+The engine computed the stop-loss from the **entry (last) price** and never
+fetched the **mark price**. Bitunix validates the trigger against the mark
+price, so when the mark sat below the last price the stop landed on the wrong
+side and the whole order was rejected.
+
+The fix:
+
+- `get_mark_price()` fetches the real mark price; `try_enter` passes it into
+  `plan_tpsl` and `build_order_body`.
+- `plan_tpsl` clamps the SL/TP to clear **both** the entry and the mark price
+  by at least `TP_SL_MIN_STOP_TICKS` ticks (default 3).
+- `validate_tpsl_side()` covers the documented rules 30020-30033 and
+  30024/30025 (liquidation side) for both directions.
+- `build_order_body` refuses locally with the symbol, direction, SL price,
+  mark price and the rule violated.
+- If no valid stop exists (high leverage + coarse tick), `TpSlSideError` names
+  the liquidation price and the limit instead of emitting an invalid stop.
+
+### 20003 `Insufficient balance`
+
+Two independent causes, both now caught before sending:
+
+1. **The tier caps the leverage.** `get_position_tiers` returns a `leverage`
+   that is the *maximum* for that notional band (AKEUSDT: 50x under 10k, 25x
+   under 20k, 10x under 80k). Asking for more makes the exchange require more
+   margin than the engine computed — which surfaces as 20003, not a leverage
+   error. The pre-flight now compares the engine's leverage against the tier.
+2. **No balance check.** The pre-flight compares the required margin against
+   the real available balance and refuses with both numbers.
+
+Configurable bounds (all default `0` = disabled, so behaviour is unchanged):
+
+| Variable | Meaning |
+|---|---|
+| `MIN_MARGIN_USDT` | refuse orders whose margin is below this |
+| `MAX_MARGIN_USDT` | refuse orders whose margin is above this |
+| `MAX_NOTIONAL_USDT` | refuse orders whose notional is above this |
+| `TP_SL_MIN_STOP_TICKS` | minimum stop distance from mark/entry, in ticks |
+
+Verify against live data: `python scripts/verify_tpsl_side.py`
 
 ---
 

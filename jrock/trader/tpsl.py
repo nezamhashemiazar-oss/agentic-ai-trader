@@ -15,7 +15,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .risk import (PairRules, Tier, liquidation_price, pick_tier, round_price,
+from .risk import (PairRules, Tier, TpSlSideError, liquidation_price,
+                   min_stop_distance, pick_tier, round_price,
                    sl_from_liq_distance)
 
 R_MULTIPLE = {"none": 1.0, "weak": 1.2, "normal": 1.8, "strong": 2.5, "extreme": 3.2}
@@ -53,20 +54,87 @@ def plan_tpsl(*, side: str, entry: float, leverage: int, notional: float,
               strength: str, confidence: float, tiers: list[Tier],
               rules: PairRules, liq_sl_distance_pct: float = 50.0,
               breakeven_pct: float = 0.6,
-              trailing_trigger_roi_pct: float = 25.0) -> TpSlPlan:
+              trailing_trigger_roi_pct: float = 25.0,
+              mark: float | None = None,
+              min_stop_ticks: int = 3) -> TpSlPlan:
+    """Build a TP/SL plan that is guaranteed to sit on the correct side.
+
+    `mark` is the exchange mark price. The exchange validates the trigger
+    against BOTH the mark price and the average entry price, so a stop that is
+    only correct relative to `entry` can still be rejected (30029/30031) when
+    the two differ. When `mark` is supplied the stop is clamped to clear the
+    worse of the two by at least `min_stop_ticks` ticks.
+    """
     tier = pick_tier(tiers, notional)
     mmr = tier.maintenance_margin_rate
     liq = liquidation_price(entry, leverage, side, mmr)
 
+    is_long = side.upper() in ("LONG", "BUY")
+    d = min_stop_distance(rules, min_stop_ticks)
+    ref = mark if (mark is not None and mark > 0) else entry
+
     sl = sl_from_liq_distance(entry, liq, side, liq_sl_distance_pct)
     sl = round_price(sl, rules.quote_precision)
+
+    # --- clamp the SL to the correct side of BOTH entry and mark.
+    # A high-leverage stop can land within a tick of the mark price; rounding
+    # then collapses it onto the mark and the exchange rejects the order.
+    if is_long:
+        ceiling = min(entry, ref) - d
+        if sl > ceiling:
+            sl = ceiling
+        # never place the stop at or below liquidation
+        if sl <= liq:
+            sl = liq + d
+    else:
+        floor = max(entry, ref) + d
+        if sl < floor:
+            sl = floor
+        if sl >= liq:
+            sl = liq - d
+    sl = round_price(sl, rules.quote_precision)
+
+    # --- feasibility: the stop must fit BETWEEN the liquidation price and the
+    # mark-side limit. At high leverage with a coarse tick there may be no room
+    # at all; refuse with the numbers instead of emitting an invalid stop.
+    if is_long:
+        if not (liq < sl < min(entry, ref)):
+            raise TpSlSideError(
+                f"{rules.symbol} LONG: no valid stop-loss exists. The stop must "
+                f"sit between the liquidation price {liq:.{rules.quote_precision}f} "
+                f"and {min(entry, ref):.{rules.quote_precision}f} "
+                f"(entry={entry:.{rules.quote_precision}f}, "
+                f"mark={ref:.{rules.quote_precision}f}), keeping "
+                f"{d:.{rules.quote_precision}f} clear of both. "
+                f"Lower the leverage or widen the tick.")
+    else:
+        if not (max(entry, ref) < sl < liq):
+            raise TpSlSideError(
+                f"{rules.symbol} SHORT: no valid stop-loss exists. The stop must "
+                f"sit between {max(entry, ref):.{rules.quote_precision}f} and the "
+                f"liquidation price {liq:.{rules.quote_precision}f} "
+                f"(entry={entry:.{rules.quote_precision}f}, "
+                f"mark={ref:.{rules.quote_precision}f}), keeping "
+                f"{d:.{rules.quote_precision}f} clear of both. "
+                f"Lower the leverage or widen the tick.")
 
     sl_dist = abs(entry - sl)
     mult = R_MULTIPLE.get(strength, 1.8)
     mult *= 0.85 + (max(0.0, min(100.0, confidence)) / 100.0) * 0.3
 
     tp_dist = sl_dist * mult
-    tp = entry + tp_dist if side.upper() in ("LONG", "BUY") else entry - tp_dist
+    tp = entry + tp_dist if is_long else entry - tp_dist
+    tp = round_price(tp, rules.quote_precision)
+
+    # --- clamp the TP to the correct side of BOTH entry and mark.
+    if is_long:
+        tp_floor = max(entry, ref) + d
+        if tp < tp_floor:
+            tp = tp_floor
+    else:
+        tp_ceiling = min(entry, ref) - d
+        if tp > tp_ceiling:
+            tp = tp_ceiling
     tp = round_price(tp, rules.quote_precision)
 
     def roi(p: float) -> float:
