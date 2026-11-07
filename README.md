@@ -55,6 +55,7 @@ python -m jrock.cli --help-cmds
 | `/price [SYMBOL]` | last / mark price for your symbols |
 | `/funding [SYMBOL]` | current funding rate |
 | `/leverage` / `/margin` | leverage and margin mode per symbol |
+| `/settings [SYMBOL]` | account trading settings: position mode, margin mode, leverage and the trading config (add a SYMBOL for its per-symbol margin mode + leverage) |
 | `/pnl` | unrealized PnL across open positions |
 | `/status` | engine + API + account summary |
 | `/symbols [SEARCH]` | tradable symbols with precision and min volume |

@@ -68,7 +68,9 @@ AGENT COMMANDS
   /batch                    batch-order status (orderList max 5, symbol required)
   /leverage                 leverage and margin mode per symbol
   /margin                   margin mode (ISOLATION|CROSS) per symbol
-  /settings [SYMBOL...]     account trading settings + position mode (one-way/hedge)
+  /settings [SYMBOL...]     account trading settings: position mode, margin mode,
+                            leverage and the trading config (add a SYMBOL for its
+                            per-symbol margin mode + leverage)
   /pnl                      unrealized PnL across open positions
   /status                   engine + API + account summary
   /symbols                  tradable symbols (or search: /symbols BTC)
@@ -1330,79 +1332,122 @@ class JRockAgent:
     async def cmd_margin(self, rest: str = "") -> str:
         return await self.cmd_leverage(rest)
 
-    async def cmd_settings(self, rest: str = "") -> str:
-        """Account trading settings and position mode.
+    # Tokens that are NOT symbols. `settings trade` is the engine's documented
+    # "show trading settings" phrase; the bare word `settings` maps to
+    # /settings, so `trade` arrives here as the `rest` argument. Forwarding it
+    # as a symbol is what produced 20015 "this Futures is not allowed to
+    # trade" - TRADE is not a tradable futures pair (verified against the live
+    # public API: 794 pairs, TRADE absent).
+    SETTINGS_KEYWORDS: frozenset[str] = frozenset({
+        "TRADE", "TRADING", "ACCOUNT", "CONFIG", "CONFIGS", "SETTINGS", "SHOW", "ALL",
+    })
 
-        Covers the two endpoints added by the API-contract audit:
-          GET /api/v1/futures/account/trading_settings  (per-symbol margin mode + leverage)
-          GET /api/v1/futures/account/position_mode     (one-way or hedge)
+    async def cmd_settings(self, rest: str = "") -> str:
+        """Account trading settings: position mode, margin mode, leverage, config.
+
+        `settings trade` and bare `settings` print the ACCOUNT-LEVEL trading
+        configuration - the live position mode plus the engine's trading
+        parameters (margin mode, leverage, risk, breakeven, trailing, ...).
+        They never send a symbol to the exchange, so they cannot raise 20015.
+
+        `settings SYMBOL` additionally shows that one symbol's configured
+        margin mode and leverage. A token that is not a tradable pair is
+        dropped with a warning instead of being sent (which would 20015).
         """
         from .trader.errors import BitunixAPIError
         if not self._has_bitunix_keys():
             return missing_keys_message()
+
+        tokens = [x.strip().upper() for x in rest.replace(",", " ").split() if x.strip()]
+        syms = [t for t in tokens if t not in self.SETTINGS_KEYWORDS]
+
         lines = ["=== account trading settings ==="]
+
+        # 1) Position mode - the account-level endpoint. It takes no
+        #    parameters, so it cannot raise 20015.
         try:
             mode = await self.engine.client.get_position_mode()
             pm = (mode or {}).get("positionMode") if isinstance(mode, dict) else mode
-            lines.append(f"position mode: {pm}")
+            lines.append(f"position mode: {pm or '?'}")
         except BitunixAPIError as e:
             lines.append(f"position mode: error {e.code}: {e.msg or e}")
         except Exception as e:  # noqa: BLE001
             lines.append(f"position mode: {type(e).__name__}: {e}")
 
-        # `settings trade` is the engine's "show engine settings" command, but
-        # the bare word `settings` also maps here, so `trade` arrives as a
-        # symbol token. Validate every requested symbol against the live
-        # trading-pairs list BEFORE calling the private endpoint: an unknown
-        # pair makes Bitunix return 20015 "This futures is not supported"
-        # (observed: `settings trade` -> 20015). Drop invalid tokens with a
-        # clear warning; if nothing valid remains, fall back to "all
-        # configured" (symbols omitted) instead of sending a bogus symbol.
-        syms = [x.strip().upper() for x in rest.replace(",", " ").split() if x.strip()]
+        # 2) The trading configuration. This is the account-level config the
+        #    command has always shown - margin mode, leverage and the rest of
+        #    the engine's trading parameters. No per-symbol listing.
+        s = self.engine.state
+        lines.append(f"margin mode: {s.margin_mode}")
+        lines.append(f"leverage: {s.leverage}x")
+        lines.append(f"max open positions: {s.max_open_positions}")
+        lines.append(f"risk per trade: {s.risk_pct}%")
+        lines.append(f"breakeven: {s.breakeven_pct}%  "
+                     f"trailing trigger: {s.trailing_trigger_roi_pct}% ROI  "
+                     f"liq SL distance: {s.liq_sl_distance_pct}%")
+        lines.append(f"min agreeing strategies: {s.min_agreeing}  "
+                     f"timeframes: {','.join(s.timeframes)}")
+        lines.append(f"min confidence: {s.min_confidence}  "
+                     f"tf min confidence: {s.tf_min_confidence}")
+        lines.append(f"scan interval: {s.scan_interval}s  "
+                     f"report interval: {s.report_interval}s")
+        lines.append(f"tpsl method: {s.tpsl_method}  "
+                     f"partial close: {s.partial_close_pct}% at {s.partial_at_roi_pct}% ROI")
+        lines.append(f"engine_on={s.engine_on} scan_on={s.scan_on} "
+                     f"autotrade={s.autotrade} mid_management={s.mid_management}")
+
+        # 3) Only when the user names a REAL symbol, show that symbol's
+        #    configured margin mode + leverage. Never a wall of symbols.
+        if syms:
+            valid = await self._valid_symbols(syms)
+            if valid is None:
+                lines.append("per-symbol settings: could not validate symbols "
+                             "(trading-pairs lookup failed) - skipped")
+                syms = []
+            else:
+                bad = [x for x in syms if x not in valid]
+                if bad:
+                    lines.append(f"per-symbol settings: skipping unknown "
+                                 f"symbol(s) {', '.join(bad)} "
+                                 f"(not a tradable futures pair)")
+                syms = [x for x in syms if x in valid]
         if syms:
             try:
-                pairs = await self.engine.client.get_trading_pairs()
-                valid = {str(r.get("symbol", "")).upper()
-                         for r in (pairs if isinstance(pairs, list) else [])}
+                data = await self.engine.client.get_trading_settings(",".join(syms))
             except BitunixAPIError as e:
-                lines.append(f"trading settings: could not validate symbols "
-                             f"(error {e.code}: {e.msg or e})")
-                return "\n".join(lines)
+                if e.code == 20015:
+                    lines.append(f"per-symbol settings: error 20015 - "
+                                 f"{', '.join(syms)} is not a tradable futures "
+                                 f"pair (use /symbols to list valid pairs)")
+                else:
+                    lines.append(f"per-symbol settings: error {e.code}: {e.msg or e}")
             except Exception as e:  # noqa: BLE001
-                lines.append(f"trading settings: could not validate symbols "
-                             f"({type(e).__name__}: {e})")
-                return "\n".join(lines)
-            bad = [s for s in syms if s not in valid]
-            if bad:
-                lines.append(f"trading settings: skipping unknown symbol(s) "
-                             f"{', '.join(bad)} (not a tradable futures pair)")
-            syms = [s for s in syms if s in valid]
-        try:
-            data = await self.engine.client.get_trading_settings(
-                ",".join(syms) if syms else None)
-        except BitunixAPIError as e:
-            if e.code == 20015:
-                lines.append("trading settings: error 20015 - the requested "
-                             "symbol is not a tradable futures pair. Use "
-                             "`/symbols` to list valid pairs, or run "
-                             "`settings` with no symbol to see all configured "
-                             "settings.")
+                lines.append(f"per-symbol settings: {type(e).__name__}: {e}")
             else:
-                lines.append(f"trading settings: error {e.code}: {e.msg or e}")
-            return "\n".join(lines)
-        except Exception as e:  # noqa: BLE001
-            lines.append(f"trading settings: {type(e).__name__}: {e}")
-            return "\n".join(lines)
-
-        rows = data if isinstance(data, list) else ([data] if data else [])
-        if not rows:
-            lines.append("trading settings: none configured")
-        for r in rows:
-            if not isinstance(r, dict):
-                continue
-            lines.append(f"  {r.get('symbol')}: leverage={r.get('leverage')}x "
-                         f"marginMode={r.get('marginMode')}")
+                rows = data if isinstance(data, list) else ([data] if data else [])
+                for r in rows:
+                    if isinstance(r, dict):
+                        lines.append(f"  {r.get('symbol')}: "
+                                     f"leverage={r.get('leverage')}x "
+                                     f"marginMode={r.get('marginMode')}")
         return "\n".join(lines)
+
+    async def _valid_symbols(self, syms: list[str]) -> set[str] | None:
+        """Best-effort: the subset of `syms` that are tradable futures pairs.
+
+        Uses the PUBLIC trading-pairs endpoint. Returns None when the lookup
+        itself fails, so the caller can skip the per-symbol section rather
+        than send a token that would raise 20015.
+        """
+        try:
+            pairs = await self.engine.client.get_trading_pairs()
+        except Exception:  # noqa: BLE001
+            return None
+        if not isinstance(pairs, list):
+            return None
+        valid = {str(r.get("symbol", "")).upper()
+                 for r in pairs if isinstance(r, dict)}
+        return {x for x in syms if x in valid}
 
     async def cmd_pnl(self) -> str:
         from .trader.errors import BitunixAPIError

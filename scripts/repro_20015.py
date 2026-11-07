@@ -1,4 +1,4 @@
-"""Reproduce Bitunix error 20015 from the `settings trade` command.
+"""Reproduce (and verify the fix for) Bitunix error 20015 on `settings trade`.
 
 No API key needed: a fake client mimics the live exchange, which returns
 20015 "this Futures is not allowed to trade" when `symbols` names a pair
@@ -30,6 +30,9 @@ class FakeBitunix:
     async def get_position_mode(self):
         return {"positionMode": "HEDGE"}
 
+    async def get_trading_pairs(self, symbols: str | None = None):
+        return [{"symbol": s} for s in sorted(VALID)]
+
     async def get_trading_settings(self, symbols: str | None = None):
         self.calls.append(symbols)
         if symbols:
@@ -59,36 +62,51 @@ async def main() -> int:
     for line in ("settings trade", "settings", "settings BTCUSDT"):
         print(f"  {line!r:24} -> {route(line)}")
 
-    print("\n=== 2. what cmd_settings() does with the parsed rest ===")
+    print("\n=== 2. the OLD behaviour: `trade` parsed as a symbol ===")
     rest = "trade"
     syms = [x.strip().upper() for x in rest.replace(",", " ").split() if x.strip()]
     print(f"  rest={rest!r} -> syms={syms} -> symbols param={','.join(syms)!r}")
-
-    print("\n=== 3. the API call that produces 20015 ===")
     fake = FakeBitunix()
     try:
         await fake.get_trading_settings(",".join(syms))
         print("  no error (unexpected)")
     except BitunixAPIError as e:
-        print(f"  -> error {e.code}: {e.msg}")
+        print(f"  -> error {e.code}: {e.msg}   <-- the reported bug")
 
-    print("\n=== 4. the same call with the symbol omitted (the fix) ===")
-    fake2 = FakeBitunix()
-    data = await fake2.get_trading_settings(None)
-    print(f"  symbols param={fake2.calls[-1]!r} -> {len(data)} row(s), no error")
+    print("\n=== 3. the FIX: `trade` is a keyword, not a symbol ===")
+    from jrock.agent import JRockAgent  # noqa: E402
+    from jrock.config import Settings  # noqa: E402
 
-    print("\n=== 5. a genuine symbol still works ===")
-    fake3 = FakeBitunix()
-    await fake3.get_trading_settings("BTCUSDT")
-    print(f"  symbols param={fake3.calls[-1]!r} -> ok")
+    s = Settings(bitunix_api_key="k", bitunix_api_secret="s")
+    a = JRockAgent(s)
+    f = FakeBitunix()
+    a.engine.client = f
+    out = await a.handle("settings trade")
+    print(f"  trading_settings calls={f.calls}  (empty = no symbol sent)")
+    print("  output:")
+    for ln in out.splitlines():
+        print(f"    {ln}")
+    assert f.calls == [], "the keyword form must not send a symbol"
+    assert "20015" not in out, "the keyword form must not raise 20015"
+    print("  -> OK: account config printed, no 20015")
 
-    print("\n=== 6. a genuinely bad symbol is still rejected ===")
-    fake4 = FakeBitunix()
-    try:
-        await fake4.get_trading_settings("NOTACOIN")
-        print("  no error (unexpected)")
-    except BitunixAPIError as e:
-        print(f"  -> error {e.code}: {e.msg}  (correct: real bad symbol)")
+    print("\n=== 4. a genuine symbol still works ===")
+    f2 = FakeBitunix()
+    a.engine.client = f2
+    out2 = await a.handle("settings BTCUSDT")
+    print(f"  trading_settings calls={f2.calls}")
+    assert f2.calls == ["BTCUSDT"]
+    assert "BTCUSDT: leverage=20x marginMode=CROSS" in out2
+    print("  -> OK")
+
+    print("\n=== 5. a genuinely bad symbol is dropped, not sent ===")
+    f3 = FakeBitunix()
+    a.engine.client = f3
+    out3 = await a.handle("settings NOTACOIN")
+    print(f"  trading_settings calls={f3.calls}  (empty = not sent)")
+    assert f3.calls == []
+    assert "20015" not in out3
+    print("  -> OK: dropped with a warning, no 20015")
 
     return 0
 

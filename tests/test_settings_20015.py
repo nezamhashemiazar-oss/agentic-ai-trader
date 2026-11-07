@@ -1,20 +1,25 @@
 """Regression tests for Bitunix error 20015 on the `settings trade` command.
 
-Observed:
+Observed (before the fix):
+
     j+rock> settings trade
     === account trading settings ===
     position mode: HEDGE
     trading settings: error 20015: this Futures is not allowed to trade.
 
 Root cause: the bare word `settings` maps to `/settings`, so `trade` arrives
-as a symbol token. `cmd_settings` sent `symbols=TRADE` to the private
-trading_settings endpoint; `TRADE` is not a tradable futures pair, and Bitunix
-returns 20015 "This futures is not supported". The position-mode call (no
-params) succeeded, which is why HEDGE read back fine.
+as the `rest` argument of `cmd_settings`. The old code treated every token as
+a symbol and sent `symbols=TRADE` to the private trading_settings endpoint.
+`TRADE` is not a tradable futures pair (verified against the live public API:
+794 pairs, TRADE absent), so Bitunix returned 20015 "This futures is not
+supported". The position-mode call takes no parameters, which is why HEDGE
+read back fine.
 
-Fix: validate every requested symbol against the live trading-pairs list
-before calling the private endpoint; drop invalid tokens with a clear warning
-and fall back to "all configured" (symbols omitted) when nothing valid remains.
+Fix: `settings trade` (and bare `settings`) print the ACCOUNT-LEVEL trading
+settings - position mode, margin mode, leverage and the engine's trading
+config - and never send a symbol to the exchange, so they cannot raise 20015.
+A token that is not a tradable pair is dropped with a warning instead of being
+forwarded. Only a genuine symbol triggers the per-symbol lookup.
 """
 from __future__ import annotations
 
@@ -79,67 +84,93 @@ def _run(coro):
 
 
 # ------------------------------------------------------------- the bug itself
-def test_settings_trade_no_longer_sends_trade_as_symbol(tmp_path):
+def test_settings_trade_never_sends_trade_as_symbol(tmp_path):
     """`settings trade` must not send symbols=TRADE to the private endpoint."""
     client = FakeClient()
     a = _agent(tmp_path, client)
     out = _run(a.handle("settings trade"))
-    # the private endpoint is called with NO symbols (falls back to all)
-    assert client.trading_settings_calls == [None]
+    # the private per-symbol endpoint is never called for the keyword form
+    assert client.trading_settings_calls == []
     assert "20015" not in out
     assert "position mode: HEDGE" in out
-    assert "trading settings:" in out
 
 
-def test_settings_trade_skips_unknown_symbol_with_warning(tmp_path):
-    """An invalid token is dropped with a warning, not sent to the API."""
+def test_settings_trade_prints_account_config_not_symbols(tmp_path):
+    """The output is the account trading config, not a per-symbol listing."""
     client = FakeClient()
     a = _agent(tmp_path, client)
     out = _run(a.handle("settings trade"))
-    assert "skipping unknown symbol(s) TRADE" in out
+    assert "=== account trading settings ===" in out
+    # account-level config lines the user asked for
+    assert "margin mode:" in out
+    assert "leverage:" in out
+    assert "max open positions:" in out
+    assert "risk per trade:" in out
+    # and NOT a wall of symbols
+    assert "  BTCUSDT: leverage=" not in out
+
+
+def test_settings_trade_does_not_validate_symbols(tmp_path):
+    """The keyword form must not even hit the trading-pairs endpoint."""
+    client = FakeClient()
+    a = _agent(tmp_path, client)
+    _run(a.handle("settings trade"))
+    assert client.trading_pairs_calls == 0
+
+
+def test_settings_bare_still_works(tmp_path):
+    """`settings` with no argument prints the account config."""
+    client = FakeClient()
+    a = _agent(tmp_path, client)
+    out = _run(a.handle("settings"))
+    assert client.trading_settings_calls == []
     assert "20015" not in out
+    assert "position mode: HEDGE" in out
+    assert "margin mode:" in out
 
 
-def test_settings_with_valid_symbol_still_queries_that_symbol(tmp_path):
+@pytest.mark.parametrize("word", ["trade", "TRADE", "trading", "account", "config"])
+def test_settings_keywords_are_not_treated_as_symbols(tmp_path, word):
+    """Every documented keyword form prints config and sends no symbol."""
+    client = FakeClient()
+    a = _agent(tmp_path, client)
+    out = _run(a.handle(f"settings {word}"))
+    assert client.trading_settings_calls == []
+    assert "20015" not in out
+    assert "margin mode:" in out
+
+
+# ------------------------------------------------------- genuine symbol path
+def test_settings_with_valid_symbol_queries_that_symbol(tmp_path):
     """A genuine symbol is still passed through to the private endpoint."""
     client = FakeClient()
     a = _agent(tmp_path, client)
     out = _run(a.handle("settings BTCUSDT"))
     assert client.trading_settings_calls == ["BTCUSDT"]
     assert "20015" not in out
-    assert "BTCUSDT" in out
+    assert "BTCUSDT: leverage=20x marginMode=CROSS" in out
 
 
 def test_settings_mixed_valid_and_invalid_filters_to_valid(tmp_path):
-    """`settings BTCUSDT TRADE` keeps BTCUSDT and drops TRADE."""
+    """`settings BTCUSDT NOTACOIN` keeps BTCUSDT and drops NOTACOIN."""
     client = FakeClient()
     a = _agent(tmp_path, client)
-    out = _run(a.handle("settings BTCUSDT TRADE"))
+    out = _run(a.handle("settings BTCUSDT NOTACOIN"))
     assert client.trading_settings_calls == ["BTCUSDT"]
-    assert "skipping unknown symbol(s) TRADE" in out
+    assert "skipping unknown symbol(s) NOTACOIN" in out
     assert "20015" not in out
 
 
-def test_settings_bare_still_works(tmp_path):
-    """`settings` with no symbol still returns all configured settings."""
-    client = FakeClient()
-    a = _agent(tmp_path, client)
-    out = _run(a.handle("settings"))
-    assert client.trading_settings_calls == [None]
-    assert "20015" not in out
-    assert "position mode: HEDGE" in out
-
-
-# ------------------------------------------------------- genuine bad symbol
-def test_settings_genuinely_bad_symbol_is_still_rejected(tmp_path):
-    """A real unknown symbol (not the `trade` keyword) is still surfaced."""
+def test_settings_genuinely_bad_symbol_is_dropped_not_sent(tmp_path):
+    """A real unknown symbol is dropped with a warning, never sent."""
     client = FakeClient()
     a = _agent(tmp_path, client)
     out = _run(a.handle("settings NOTACOIN"))
-    # NOTACOIN is not in the pairs list, so it is dropped with a warning
     assert "skipping unknown symbol(s) NOTACOIN" in out
     assert "20015" not in out
-    assert client.trading_settings_calls == [None]
+    assert client.trading_settings_calls == []
+    # the account config is still shown
+    assert "margin mode:" in out
 
 
 def test_settings_20015_from_api_is_actionable(tmp_path):
@@ -155,6 +186,22 @@ def test_settings_20015_from_api_is_actionable(tmp_path):
     assert "20015" in out
     assert "not a tradable futures pair" in out
     assert "/symbols" in out
+
+
+def test_settings_pairs_lookup_failure_skips_symbol_section(tmp_path):
+    """If the pairs lookup fails, skip the per-symbol section, don't 20015."""
+    client = FakeClient()
+
+    async def boom(symbols=None):
+        raise RuntimeError("network down")
+
+    client.get_trading_pairs = boom
+    a = _agent(tmp_path, client)
+    out = _run(a.handle("settings BTCUSDT"))
+    assert "could not validate symbols" in out
+    assert client.trading_settings_calls == []
+    assert "20015" not in out
+    assert "margin mode:" in out
 
 
 # ------------------------------------------------------------- routing guard
