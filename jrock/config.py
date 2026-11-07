@@ -110,6 +110,31 @@ class Settings:
     #: cap is reached, so the file cannot grow without bound.
     max_memory_items: int = 5000
 
+    # ---------------------------------------------------------------- TP/SL methods
+    #: Which of the four documented Bitunix TP/SL methods the engine uses.
+    #: Per the official academy article "Bitunix Futures: 4 TP/SL Methods Guide",
+    #: the four are Position, Partial, Trailing and Account TP/SL.
+    #:   POSITION - one TP/SL closes the ENTIRE position (native endpoint)
+    #:   PARTIAL  - a defined % of the position closes at each trigger, staged
+    #:              exits (native endpoint, via tpQty/slQty)
+    #:   TRAILING - dynamic exit after a trend + retracement (software ratchet
+    #:              on top of the native position TP/SL)
+    #:   ACCOUNT  - closes ALL positions when total account PnL crosses a
+    #:              threshold (software; Bitunix exposes no API for it)
+    tpsl_method: str = "POSITION"
+    #: PARTIAL: what fraction of the position to close at the partial trigger.
+    partial_close_pct: float = 50.0
+    #: PARTIAL: the ROI (%) at which the partial close fires.
+    partial_at_roi_pct: float = 50.0
+    #: ACCOUNT: close every position when total unrealized PnL reaches these
+    #: USDT thresholds. 0 disables that side. Both 0 = the method is inert.
+    account_tp_usdt: float = 0.0
+    account_sl_usdt: float = 0.0
+    #: ACCOUNT: also close when total PnL crosses this % of account equity.
+    #: 0 disables. Useful when the account size changes.
+    account_tp_pct: float = 0.0
+    account_sl_pct: float = 0.0
+
     @property
     def data_dir(self) -> Path:
         p = ROOT / "data"

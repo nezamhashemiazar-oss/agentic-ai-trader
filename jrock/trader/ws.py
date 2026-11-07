@@ -590,3 +590,79 @@ class MarketDataFeed:
 
     async def stop(self) -> None:
         await self.ws.stop()
+
+
+# ---------------------------------------------------------------- private feed
+
+class PrivateFeed:
+    """The private WS: balance, position, order and TP/SL channels.
+
+    WHY THIS EXISTS
+    ---------------
+    `PRIVATE_CHANNELS` was defined but never subscribed - the only reference to
+    it was a help string in `/ws`. So the engine had no live view of its own
+    account: a TP/SL that fired, or a position the exchange closed, was only
+    noticed on the next REST poll.
+
+    The official Tp Sl channel doc defines the push as:
+
+        {"ch": "tpsl", "data": {"id": ..., "positionId": ..., "symbol": ...,
+         "tpPrice": ..., "slPrice": ..., "tpQty": ..., "slQty": ...,
+         "status": ..., "ctime": ...}}
+
+    This class subscribes all four private channels, keeps the latest frame per
+    channel, and exposes counters so `/ws` can report real state.
+
+    UNVERIFIED WITHOUT CREDENTIALS: the private login handshake needs
+    BITUNIX_API_KEY / BITUNIX_API_SECRET. The frame shapes and the login
+    signature are implemented from the official docs and the Go demo, but the
+    live handshake has NOT been exercised in this sandbox. Do not read this
+    class as "tested against the live private server".
+    """
+
+    def __init__(self, cfg: WSConfig, channels: list[str] | None = None):
+        self.ws = BitunixWebSocket(cfg, private=True)
+        self.channels = [c for c in (channels or list(PRIVATE_CHANNELS))
+                         if c in PRIVATE_CHANNELS]
+        self.latest: dict[str, Any] = {}
+        self.counts: dict[str, int] = {c: 0 for c in self.channels}
+        self.tpsl_events: list[dict] = []
+        self._wire()
+
+    def _wire(self) -> None:
+        for ch in self.channels:
+            self.ws.subscribe(PRIVATE_CHANNELS[ch])
+            self.ws.on(PRIVATE_CHANNELS[ch], self._make_handler(ch))
+
+    def _make_handler(self, ch: str):
+        def _handler(ev: Event) -> None:
+            self.latest[ch] = ev.data
+            self.counts[ch] = self.counts.get(ch, 0) + 1
+            if ch == "tpsl":
+                # Keep a bounded tail of TP/SL pushes so the engine can react to
+                # a stop that fired without waiting for the next REST poll.
+                self.tpsl_events.append({"ts": ev.ts, "data": ev.data})
+                if len(self.tpsl_events) > 200:
+                    del self.tpsl_events[:-200]
+        return _handler
+
+    @property
+    def connected(self) -> bool:
+        return self.ws.connected
+
+    @property
+    def logged_in(self) -> bool:
+        return self.ws.logged_in
+
+    def stats(self) -> dict:
+        s = self.ws.stats()
+        s["channels"] = list(self.channels)
+        s["counts"] = dict(self.counts)
+        s["tpsl_events"] = len(self.tpsl_events)
+        return s
+
+    async def start(self) -> None:
+        await self.ws.start()
+
+    async def stop(self) -> None:
+        await self.ws.stop()

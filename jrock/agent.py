@@ -60,7 +60,9 @@ AGENT COMMANDS
   /positions                open positions with entry, mark, liq and unrealized PnL
   /orders                   pending orders
   /price [SYMBOL]           last / mark price for your symbols
-  /funding [SYMBOL]         current funding rate
+  /funding [SYMBOL]         current funding rate (or: /funding history SYMBOL)
+  /tpsl                     the 4 TP/SL methods: show/set, pending, history, cancel
+  /batch                    batch-order status (orderList max 5, symbol required)
   /leverage                 leverage and margin mode per symbol
   /margin                   margin mode (ISOLATION|CROSS) per symbol
   /pnl                      unrealized PnL across open positions
@@ -91,6 +93,11 @@ TRADER ENGINE COMMANDS
   close position [SYMBOL]           margin mode ISOLATION|CROSS
   position mode HEDGE|ONE_WAY       symbols BTCUSDT,ETHUSDT
   max open positions 3              leverage 10 | risk 1.0
+  tpsl method POSITION|PARTIAL|TRAILING|ACCOUNT
+  partial close pct 50              partial at roi 50
+  account tp usdt 100               account sl usdt 50
+  account tp pct 5                  account sl pct 3
+  margin add BTCUSDT 100            margin reduce BTCUSDT 50
 
 PERMISSIONS
   auto accept edit on|off    apply self-edits automatically vs. show diff
@@ -131,6 +138,8 @@ AGENT_BARE: dict[str, str] = {
     "orders": "/orders", "order": "/orders",
     "price": "/price", "prices": "/price", "quote": "/price",
     "funding": "/funding", "funding_rate": "/funding",
+    "tpsl": "/tpsl", "tp_sl": "/tpsl", "tpsl_method": "/tpsl",
+    "batch": "/batch", "batch_order": "/batch",
     "leverage": "/leverage", "lev": "/leverage",
     "margin": "/margin", "margin_mode": "/margin",
     "pnl": "/pnl", "p&l": "/pnl",
@@ -149,6 +158,7 @@ FREE_TEXT_WORDS: tuple[str, ...] = (
 # engine syntax ("leverage 20"); bare they are a read ("leverage").
 QUERY_COMMANDS: frozenset[str] = frozenset({
     "/leverage", "/margin", "/symbols", "/price", "/funding", "/status", "/pnl",
+    "/tpsl", "/batch",
 })
 
 # Natural-language intents we handle deterministically instead of guessing.
@@ -286,6 +296,8 @@ class JRockAgent:
             f"market_data_state={self.engine.market_data_report()}",
             f"tp_sl_trigger={self.s.tp_sl_trigger_type}",
             f"order_unit={self.s.order_unit}",
+            f"tpsl_method={self.engine.tpsl_method_report()}",
+            f"private_ws={self.engine.private_feed_report()}",
             f"price_cache={self._cache_line()}",
             f"kline_cache={self._kline_cache_line()}",
             f"memory={self.memory.stats()['total']} entries "
@@ -436,6 +448,9 @@ class JRockAgent:
         if self.s.market_data_source == "ws":
             await self.engine.start_feed()
         lines.append(f"Market data: {self.engine.market_data_report()}")
+        lines.append(f"  {self.engine.tpsl_method_report()}")
+        if self.s.market_data_source == "ws":
+            lines.append(f"  {self.engine.private_feed_report()}")
         if self.s.market_data_source == "ws" and not self.engine.feed_connected():
             lines.append("  WARNING: MARKET_DATA_SOURCE=ws but the feed is NOT connected. "
                          "The engine is running on REST fallback.")
@@ -525,6 +540,10 @@ class JRockAgent:
             return await self.cmd_price(rest)
         if cmd == "/funding":
             return await self.cmd_funding(rest)
+        if cmd == "/tpsl":
+            return await self.cmd_tpsl(rest)
+        if cmd == "/batch":
+            return await self.cmd_batch(rest)
         if cmd == "/leverage":
             return await self.cmd_leverage(rest)
         if cmd == "/margin":
@@ -944,6 +963,21 @@ class JRockAgent:
         # --- kline cache: the part that decides whether scans still poll REST
         lines += ["", "--- kline cache ---", self.engine.kline_cache_report()]
 
+        # --- private channels: balance / position / order / tpsl
+        lines += ["", "--- private channels ---", self.engine.private_feed_report()]
+        pf = self.engine.private_feed
+        if pf is not None:
+            pst = pf.stats()
+            lines += [
+                f"logged_in={pst['logged_in']}  connected={pst['connected']}  "
+                f"reconnects={pst['reconnects']}",
+                f"subscriptions={pst['subscriptions']}  messages={pst['messages']}",
+                "counts: " + ", ".join(f"{k}={v}" for k, v in pst["counts"].items()),
+                f"tpsl events buffered: {pst['tpsl_events']}",
+            ]
+            if pst["last_error"]:
+                lines.append(f"last error: {pst['last_error']}")
+
         lines += ["", "public channels:  " + ", ".join(sorted(set(PUBLIC_CHANNELS.values()))),
                   "private channels: " + ", ".join(sorted(set(PRIVATE_CHANNELS.values())))]
         return "\n".join(lines)
@@ -1095,7 +1129,25 @@ class JRockAgent:
 
     async def cmd_funding(self, rest: str = "") -> str:
         from .trader.errors import BitunixAPIError
-        syms = [x.strip().upper() for x in rest.replace(",", " ").split() if x.strip()]
+        args = [x.strip() for x in rest.replace(",", " ").split() if x.strip()]
+        # /funding history SYMBOL -> the documented history endpoint
+        if args and args[0].lower() in ("history", "hist"):
+            sym = (args[1].upper() if len(args) > 1
+                   else (self.s.symbols[0] if self.s.symbols else "BTCUSDT"))
+            try:
+                data = await self.engine.client.get_funding_rate_history(sym, limit=10)
+            except BitunixAPIError as e:
+                return f"Bitunix error {e.code}: {e.msg or e}"
+            except Exception as e:  # noqa: BLE001
+                return f"funding history failed: {type(e).__name__}: {e}"
+            rows = data if isinstance(data, list) else [data] if data else []
+            if not rows:
+                return f"no funding history for {sym}"
+            lines = [f"=== funding rate history: {sym} ==="]
+            for f in rows[:10]:
+                lines.append(f"  {f.get('fundingRate')}  at {f.get('fundingTime', '?')}")
+            return "\n".join(lines)
+        syms = [x.upper() for x in args]
         syms = syms or list(self.s.symbols)
         try:
             data = await self.engine.client.get_funding_rate_batch(",".join(syms))
@@ -1104,6 +1156,9 @@ class JRockAgent:
         except Exception as e:  # noqa: BLE001
             return f"funding request failed: {type(e).__name__}: {e}"
         rows = data if isinstance(data, list) else [data] if data else []
+        # The live endpoint ignores its `symbols` filter and returns every
+        # symbol, so filter here or `/funding BTCUSDT` prints the whole market.
+        rows = self.engine.client.filter_funding_rows(rows, syms)
         if not rows:
             return f"no funding data for {','.join(syms)}"
         lines = ["=== funding rate ==="]
@@ -1111,6 +1166,132 @@ class JRockAgent:
             lines.append(f"{f.get('symbol')} rate={f.get('fundingRate')} "
                          f"next={f.get('nextFundingTime', '?')}")
         return "\n".join(lines)
+
+    async def cmd_tpsl(self, rest: str = "") -> str:
+        """The four documented Bitunix TP/SL methods, and their live state.
+
+        Per the official academy article "Bitunix Futures: 4 TP/SL Methods
+        Guide" the four are Position, Partial, Trailing and Account TP/SL.
+        Position and Partial are enforced by the exchange; Trailing and Account
+        are software and only run while the manage loop is up.
+        """
+        from .trader.errors import BitunixAPIError
+        args = [x.strip() for x in rest.replace(",", " ").split() if x.strip()]
+        sub = args[0].lower() if args else ""
+
+        if sub in ("pending", "orders"):
+            if not self._has_bitunix_keys():
+                return missing_keys_message()
+            try:
+                data = await self.engine.client.get_pending_tp_sl_order(
+                    symbol=args[1].upper() if len(args) > 1 else None, limit=20)
+            except BitunixAPIError as e:
+                return f"Bitunix error {e.code}: {e.msg or e}"
+            except Exception as e:  # noqa: BLE001
+                return f"pending TP/SL failed: {type(e).__name__}: {e}"
+            rows = data if isinstance(data, list) else [data] if data else []
+            if not rows:
+                return "no pending TP/SL orders"
+            lines = ["=== pending TP/SL orders ==="]
+            for o in rows:
+                lines.append(
+                    f"  {o.get('symbol')} id={o.get('id')} pos={o.get('positionId')} "
+                    f"tp={o.get('tpPrice')}({o.get('tpStopType')}) "
+                    f"sl={o.get('slPrice')}({o.get('slStopType')}) "
+                    f"tpQty={o.get('tpQty')} slQty={o.get('slQty')}")
+            return "\n".join(lines)
+
+        if sub in ("history", "hist"):
+            if not self._has_bitunix_keys():
+                return missing_keys_message()
+            try:
+                data = await self.engine.client.get_history_tp_sl_order(
+                    symbol=args[1].upper() if len(args) > 1 else None, limit=20)
+            except BitunixAPIError as e:
+                return f"Bitunix error {e.code}: {e.msg or e}"
+            except Exception as e:  # noqa: BLE001
+                return f"TP/SL history failed: {type(e).__name__}: {e}"
+            rows = (data or {}).get("orderList") if isinstance(data, dict) else data
+            rows = rows if isinstance(rows, list) else []
+            if not rows:
+                return "no TP/SL history"
+            lines = ["=== TP/SL history ==="]
+            for o in rows[:20]:
+                lines.append(f"  {o.get('symbol')} id={o.get('id')} "
+                             f"status={o.get('status')} tp={o.get('tpPrice')} "
+                             f"sl={o.get('slPrice')} ctime={o.get('ctime')}")
+            return "\n".join(lines)
+
+        if sub in ("cancel", "off"):
+            if len(args) < 3:
+                return ("usage: /tpsl cancel SYMBOL ORDER_ID\n"
+                        "(official: BOTH symbol and orderId are required)")
+            if not self._has_bitunix_keys():
+                return missing_keys_message()
+            try:
+                res = await self.engine.client.cancel_tp_sl_order(
+                    args[1].upper(), args[2])
+            except BitunixAPIError as e:
+                return f"Bitunix error {e.code}: {e.msg or e}"
+            except Exception as e:  # noqa: BLE001
+                return f"cancel failed: {type(e).__name__}: {e}"
+            return f"cancel requested: {res}"
+
+        if sub in ("method", "set") and len(args) > 1:
+            m = args[1].upper()
+            if m not in ("POSITION", "PARTIAL", "TRAILING", "ACCOUNT"):
+                return ("method must be one of POSITION | PARTIAL | TRAILING | ACCOUNT")
+            self.engine.state.tpsl_method = m
+            self.engine._persist_if_changed()
+            return self.engine.tpsl_method_report()
+
+        # default: show the four methods and which one is active
+        lines = [
+            "=== the 4 Bitunix TP/SL methods ===",
+            "  1. POSITION  one TP/SL closes the ENTIRE position (native, exchange-enforced)",
+            "  2. PARTIAL   a defined % closes at each trigger, staged exits (native, tpQty/slQty)",
+            "  3. TRAILING  dynamic exit after a trend + retracement (software ratchet)",
+            "  4. ACCOUNT   closes ALL positions when total account PnL crosses a threshold (software)",
+            "",
+            self.engine.tpsl_method_report(),
+            f"  partial: close {self.engine.state.partial_close_pct:g}% at "
+            f"{self.engine.state.partial_at_roi_pct:g}% ROI",
+            f"  account: TP +{self.engine.state.account_tp_usdt:g} USDT / "
+            f"SL -{self.engine.state.account_sl_usdt:g} USDT / "
+            f"TP {self.engine.state.account_tp_pct:g}% / "
+            f"SL {self.engine.state.account_sl_pct:g}% of equity",
+            "",
+            "set:  tpsl method PARTIAL | partial close pct 50 | partial at roi 50",
+            "      account tp usdt 100 | account sl usdt 50 | account tp pct 5",
+            "read: /tpsl pending [SYMBOL] | /tpsl history [SYMBOL]",
+            "      /tpsl cancel SYMBOL ORDER_ID",
+        ]
+        return "\n".join(lines)
+
+    async def cmd_batch(self, rest: str = "") -> str:
+        """Batch order status. Official: symbol AND orderList required, max 5."""
+        from .trader.errors import BitunixAPIError
+        args = [x.strip() for x in rest.replace(",", " ").split() if x.strip()]
+        if args and args[0].lower() in ("cancel", "close"):
+            if not self._has_bitunix_keys():
+                return missing_keys_message()
+            sym = args[1].upper() if len(args) > 1 else None
+            try:
+                res = await self.engine.client.cancel_all_orders(sym)
+            except BitunixAPIError as e:
+                return f"Bitunix error {e.code}: {e.msg or e}"
+            except Exception as e:  # noqa: BLE001
+                return f"cancel all failed: {type(e).__name__}: {e}"
+            return f"cancel-all requested for {sym or 'all symbols'}: {res}"
+        return (
+            "=== batch order ===\n"
+            "  endpoint: POST /api/v1/futures/trade/batch_order\n"
+            "  required: symbol AND orderList (max 5 orders)\n"
+            "  rate limit: 2 req/sec/uid\n"
+            "  response: successList[] / failureList[] (per-order errorCode)\n"
+            "  the engine sends batch orders through client.batch_order(symbol, orderList)\n"
+            "  usage: /batch cancel [SYMBOL]   cancel all open orders"
+        )
 
     async def cmd_leverage(self, rest: str = "") -> str:
         from .trader.errors import BitunixAPIError

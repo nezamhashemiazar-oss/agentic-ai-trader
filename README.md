@@ -656,6 +656,67 @@ Verify against live data: `python scripts/verify_tpsl_side.py`
 
 ---
 
+## API-doc audit (2026-11-07)
+
+Every endpoint below was read against its official doc page and the engine's
+implementation. Eight real defects were found and fixed.
+
+| # | Endpoint | Defect | Fix |
+|---|---|---|---|
+| 1 | `GET /tpsl/get_pending_orders` | engine called `get_pending_order` (singular) → 404 | path corrected |
+| 2 | `GET /tpsl/get_history_orders` | engine called `get_history_order` (singular) → 404 | path corrected |
+| 3 | `POST /tpsl/cancel_order` | sent only `orderId`; `symbol` is **required** | `symbol` added |
+| 4 | `GET /tpsl/get_*_orders` | sent `page`/`pageSize`; docs say `skip`/`limit` | params corrected |
+| 5 | `POST /trade/batch_order` | sent only `orderList`; `symbol` is **required**, max 5 | `symbol` added + cap |
+| 6 | `POST /account/adjust_position_margin` | always sent `positionId`, never `side`; docs say *either* | both supported |
+| 7 | `GET /market/get_funding_rate_history` | engine called `funding_rate/history` → **404 (verified live)** | path corrected |
+| 8 | `GET /market/funding_rate/batch` | `symbols` filter is **ignored by the server** (verified live: 931 rows for 2 symbols) | client-side filter added |
+
+Also: the private **Tp Sl WebSocket channel was never subscribed** —
+`PRIVATE_CHANNELS` existed only as help text. A `PrivateFeed` now subscribes
+`balance`/`position`/`order`/`tpsl` and parses the documented push shape.
+
+**Unverified:** the private login needs `BITUNIX_API_KEY`/`SECRET`, which are not
+present in the build sandbox. The private handshake was **not** exercised against
+the live server and is not claimed to work.
+
+Verify: `python scripts/verify_four_tpsl_and_docs.py`
+
+---
+
+## The 4 TP/SL methods
+
+These are the four from the official academy article *"Bitunix Futures
+Positions: Guide to Four TP/SL Methods"* — a different axis from the four
+order-type/trigger-type combinations above. `TPSL_METHOD` selects one.
+
+| Method | What it does | Endpoint | Enforced by | Code |
+|---|---|---|---|---|
+| `POSITION` | one TP/SL closes the **entire** position | `POST /api/v1/futures/tpsl/position/place_order` | exchange | `client.py` `place_position_tp_sl_order` |
+| `PARTIAL` | a defined **%** closes at each trigger, the rest stays open | `POST /api/v1/futures/tpsl/place_order` (`tpQty`/`slQty`) | exchange | `engine.py` `place_partial_tp_sl` |
+| `TRAILING` | arms after a trend, then trails behind price | none — software | manage loop | `tpsl.py` `plan_tpsl` + `engine.py` `_manage_positions` |
+| `ACCOUNT` | closes **all** positions when total account PnL crosses a threshold | none — software | manage loop | `account_tpsl.py` `account_tpsl_decision` |
+
+**The honest caveat:** `POSITION` and `PARTIAL` are enforced by the exchange, so
+they survive the engine being down. `TRAILING` and `ACCOUNT` have no native
+endpoint — they are software and only fire while the manage loop is running.
+`/status` says which is active and whether it needs the loop.
+
+`PARTIAL` is the reason `place_tp_sl_order` takes `tpQty`/`slQty`: the position
+endpoint has **no quantity field at all**, so it can only ever close the whole
+position. A staged exit is only possible through the standalone endpoint.
+
+```
+tpsl method PARTIAL          # select the method
+partial close pct 25         # PARTIAL: close 25% at the trigger
+partial at roi 50            # PARTIAL: trigger at 50% ROI
+account tp usdt 100          # ACCOUNT: close all at +100 USDT total
+account sl usdt 50           # ACCOUNT: close all at -50 USDT total
+account tp pct 5             # ACCOUNT: ...or at +5% of available equity
+```
+
+---
+
 ## The 4 TP/SL variants and the 3 order units
 
 ### The 4 TP/SL variants

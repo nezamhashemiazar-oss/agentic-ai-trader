@@ -19,6 +19,8 @@ from typing import Any, Callable
 
 from ..config import Settings
 from ..store import Store
+from .account_tpsl import (AccountTpSlConfig, account_tpsl_decision,
+                           total_unrealized_pnl)
 from .aggregator import Aggregate, aggregate
 from .client import BitunixClient, BitunixConfig
 from .errors import BitunixAPIError
@@ -28,14 +30,14 @@ from .order_builder import (OrderValidationError, build_order_body,
                             debug_order_enabled, log_order_body)
 from .price_cache import PriceCache
 from .risk import (PairRules, Tier, TpSlSideError, clamp_sl, clamp_tp,
-                   format_price, margin_required, pick_tier,
+                   format_price, format_qty, margin_required, pick_tier,
                    position_size_by_risk, qty_from_notional, qty_from_unit,
                    roi_pct, round_price, round_step, unit_from_qty,
                    validate_tpsl_side)
 from .strategies import build_strategies
 from .tpsl import (PositionState, mid_management_action, next_trailing_stop,
                    plan_tpsl, should_breakeven, should_trail)
-from .ws import MarketDataFeed, WSConfig
+from .ws import MarketDataFeed, PrivateFeed, WSConfig
 
 log = logging.getLogger("jrock.engine")
 
@@ -68,6 +70,14 @@ class EngineState:
     last_report_ts: float = 0.0
     scans: int = 0
     errors: list[str] = field(default_factory=list)
+    # --- the four documented TP/SL methods (see account_tpsl.py / tpsl.py)
+    tpsl_method: str = "POSITION"
+    partial_close_pct: float = 50.0
+    partial_at_roi_pct: float = 50.0
+    account_tp_usdt: float = 0.0
+    account_sl_usdt: float = 0.0
+    account_tp_pct: float = 0.0
+    account_sl_pct: float = 0.0
 
 
 class TraderEngine:
@@ -92,6 +102,13 @@ class TraderEngine:
             tf_min_confidence=settings.tf_min_confidence,
             scan_interval=settings.scan_interval,
             report_interval=settings.report_interval,
+            tpsl_method=(settings.tpsl_method or "POSITION").upper(),
+            partial_close_pct=settings.partial_close_pct,
+            partial_at_roi_pct=settings.partial_at_roi_pct,
+            account_tp_usdt=settings.account_tp_usdt,
+            account_sl_usdt=settings.account_sl_usdt,
+            account_tp_pct=settings.account_tp_pct,
+            account_sl_pct=settings.account_sl_pct,
         )
         self.client = BitunixClient(BitunixConfig(
             api_key=settings.bitunix_api_key,
@@ -112,6 +129,11 @@ class TraderEngine:
         self.feed: MarketDataFeed | None = None
         self.feed_error: str = ""
         self.feed_started_at: float = 0.0
+        #: Private WS (balance/position/order/tpsl). Only opened when the
+        #: credentials are present AND the source is ws - it is never opened in
+        #: rest mode, so rest mode still opens zero sockets.
+        self.private_feed: PrivateFeed | None = None
+        self.private_feed_error: str = ""
         self.rest_price_calls: int = 0
         self.rest_kline_calls: int = 0
         self.kline_warmup_calls: int = 0
@@ -145,6 +167,8 @@ class TraderEngine:
         "trailing_trigger_roi_pct", "liq_sl_distance_pct",
         "min_agreeing", "timeframes", "min_confidence", "tf_min_confidence",
         "scans",
+        "tpsl_method", "partial_close_pct", "partial_at_roi_pct",
+        "account_tp_usdt", "account_sl_usdt", "account_tp_pct", "account_sl_pct",
     )
 
     def _state_snapshot(self) -> dict[str, Any]:
@@ -270,14 +294,50 @@ class TraderEngine:
             self.feed_error = f"{type(e).__name__}: {e}"
             log.warning("ws feed failed to start: %s - falling back to REST", e)
             self.feed = None
+        # The private feed carries balance/position/order/tpsl. It needs
+        # credentials, so it is skipped (with a reason) when they are absent -
+        # the public feed keeps working either way.
+        if self.s.bitunix_api_key and self.s.bitunix_api_secret:
+            try:
+                self.private_feed = PrivateFeed(cfg)
+                await self.private_feed.start()
+                for _ in range(30):
+                    if self.private_feed.ws.logged_in:
+                        break
+                    await asyncio.sleep(0.1)
+            except Exception as e:  # noqa: BLE001
+                self.private_feed_error = f"{type(e).__name__}: {e}"
+                log.warning("private ws feed failed: %s", e)
+                self.private_feed = None
+        else:
+            self.private_feed_error = "no BITUNIX_API_KEY/SECRET - private channels not subscribed"
 
     async def stop_feed(self) -> None:
+        if self.private_feed is not None:
+            try:
+                await self.private_feed.stop()
+            except Exception as e:  # noqa: BLE001
+                log.debug("private ws feed stop: %s", e)
+            self.private_feed = None
         if self.feed is not None:
             try:
                 await self.feed.stop()
             except Exception as e:  # noqa: BLE001
                 log.debug("ws feed stop: %s", e)
             self.feed = None
+
+    def private_feed_report(self) -> str:
+        """Honest one-liner for the private channels."""
+        if self.s.market_data_source != "ws":
+            return "private ws: not opened (MARKET_DATA_SOURCE=rest)"
+        if self.private_feed is None:
+            why = f" - {self.private_feed_error}" if self.private_feed_error else ""
+            return f"private ws: NOT connected{why}"
+        st = self.private_feed.stats()
+        state = "logged in" if st["logged_in"] else (
+            "connected, login pending" if st["connected"] else "DISCONNECTED")
+        return (f"private ws: {state}, channels={','.join(st['channels'])} "
+                f"msgs={sum(st['counts'].values())} tpsl_events={st['tpsl_events']}")
 
     def _feed_symbols(self) -> list[str]:
         """Every symbol the engine needs a price for."""
@@ -901,6 +961,93 @@ class TraderEngine:
             return {"ok": False, "reason": str(e), "hint": e.hint}
 
     # ================================================================ management
+    async def place_partial_tp_sl(self, sym: str, position_id: str, side: str,
+                                  qty: float, tp: float, sl: float,
+                                  rules: PairRules) -> dict:
+        """PARTIAL TP/SL (method 2 of 4) via the native standalone endpoint.
+
+        The position TP/SL endpoint has NO quantity field - it can only close
+        the whole position. The standalone `/tpsl/place_order` endpoint takes
+        `tpQty`/`slQty`, which is what makes a staged exit possible: a defined
+        portion closes at the trigger and the remainder stays open.
+
+        Official requirements enforced here: `symbol` + `positionId` required,
+        at least one of tpPrice/slPrice, and at least one of tpQty/slQty.
+        """
+        trigger_type = (self.s.tp_sl_trigger_type or "MARK_PRICE").upper()
+        body: dict[str, Any] = {
+            "symbol": sym, "positionId": str(position_id),
+            "tpStopType": trigger_type, "slStopType": trigger_type,
+            "tpOrderType": "MARKET", "slOrderType": "MARKET",
+        }
+        if tp and tp > 0:
+            body["tpPrice"] = format_price(tp, rules)
+            body["tpQty"] = format_qty(qty, rules)
+        if sl and sl > 0:
+            body["slPrice"] = format_price(sl, rules)
+            body["slQty"] = format_qty(qty, rules)
+        if "tpPrice" not in body and "slPrice" not in body:
+            raise ValueError(
+                f"partial TP/SL for {sym}: no valid tp/sl price to attach")
+        return await self.client.place_tp_sl_order(**body)
+
+    async def close_all_positions(self) -> dict:
+        """Close every open position - the ACCOUNT TP/SL action.
+
+        Uses the documented `close_all_position` endpoint (market close of all
+        positions). Falls back to per-position flash close if the bulk call
+        fails, so a single API hiccup cannot leave the account half-flattened.
+        """
+        try:
+            await self.client.close_all_position()
+            self.positions.clear()
+            self.persist_positions()
+            return {"ok": True, "via": "close_all_position"}
+        except BitunixAPIError as e:
+            log.warning("close_all_position failed (%s) - falling back to "
+                        "per-position close", e)
+        closed, failed = 0, 0
+        for p in await self.open_positions():
+            pid = str(p.get("positionId") or "")
+            if not pid:
+                continue
+            try:
+                await self.client.flash_close_position(pid)
+                closed += 1
+            except BitunixAPIError:
+                failed += 1
+        self.positions.clear()
+        self.persist_positions()
+        return {"ok": failed == 0, "via": "flash_close_position",
+                "closed": closed, "failed": failed}
+
+    def tpsl_method_report(self) -> str:
+        """One honest line about which of the four TP/SL methods is active.
+
+        The four are the ones the official academy article defines: Position,
+        Partial, Trailing and Account TP/SL. Position and Partial are enforced
+        by the exchange; Trailing and Account are software and only run while
+        the manage loop is up - which this line says out loud.
+        """
+        m = (self.state.tpsl_method or "POSITION").upper()
+        if m == "PARTIAL":
+            return (f"TP/SL method: PARTIAL (native, closes "
+                    f"{self.state.partial_close_pct:g}% at "
+                    f"{self.state.partial_at_roi_pct:g}% ROI; exchange-enforced)")
+        if m == "TRAILING":
+            return (f"TP/SL method: TRAILING (software ratchet, arms at "
+                    f"{self.state.trailing_trigger_roi_pct:g}% ROI; "
+                    f"needs the manage loop running)")
+        if m == "ACCOUNT":
+            cfg = AccountTpSlConfig(
+                tp_usdt=self.state.account_tp_usdt,
+                sl_usdt=self.state.account_sl_usdt,
+                tp_pct=self.state.account_tp_pct, sl_pct=self.state.account_sl_pct)
+            return (f"TP/SL method: ACCOUNT ({cfg.describe()}; software - "
+                    f"needs the manage loop running)")
+        return ("TP/SL method: POSITION (native, closes the whole position; "
+                "exchange-enforced)")
+
     async def _manage_loop(self) -> None:
         while not self._stop.is_set():
             try:
@@ -940,6 +1087,39 @@ class TraderEngine:
         for pid in list(self.positions):
             if pid not in live_ids:
                 self.positions.pop(pid, None)
+
+        # --- ACCOUNT TP/SL (method 4 of 4). The whole futures account is the
+        # control unit: when TOTAL unrealized PnL crosses the configured
+        # threshold, every position closes. Bitunix exposes no API for this, so
+        # it is enforced here in software - which means it only fires while
+        # this loop is running. That limitation is stated in /status, not hidden.
+        acct_cfg = AccountTpSlConfig(
+            tp_usdt=self.state.account_tp_usdt, sl_usdt=self.state.account_sl_usdt,
+            tp_pct=self.state.account_tp_pct, sl_pct=self.state.account_sl_pct)
+        if acct_cfg.enabled and positions:
+            total_pnl = total_unrealized_pnl(positions)
+            equity = 0.0
+            try:
+                acct = await self.client.get_single_account()
+                a = acct[0] if isinstance(acct, list) and acct else (acct or {})
+                equity = float(a.get("available", 0) or 0)
+            except (BitunixAPIError, TypeError, ValueError):
+                equity = 0.0
+            decision = account_tpsl_decision(total_pnl=total_pnl, equity=equity,
+                                             cfg=acct_cfg)
+            if decision.should_close_all:
+                log.warning("ACCOUNT TP/SL: %s", decision.reason)
+                closed = await self.close_all_positions()
+                actions.append({"action": f"account_{decision.trigger}",
+                                "total_pnl": round(total_pnl, 2),
+                                "threshold": decision.threshold,
+                                "reason": decision.reason, "result": closed})
+                self._log_tpsl({"event": f"account_{decision.trigger}",
+                                "ts": time.time(), "total_pnl": round(total_pnl, 2),
+                                "threshold": decision.threshold,
+                                "reason": decision.reason})
+                self.persist_positions()
+                return actions
 
         for p in positions:
             pid = str(p.get("positionId"))
@@ -1047,24 +1227,43 @@ class TraderEngine:
                 actions.append({"action": "close_reversal", "symbol": sym,
                                 "roi": round(roi, 2), "result": res})
             elif action == "partial_close" and not st.partial_done:
-                half = round_step(st.qty / 2, self.rules.get(sym, PairRules(sym)).base_precision)
-                if half > 0:
+                # PARTIAL TP/SL (method 2 of 4): close a DEFINED % of the
+                # position, leaving the rest open. When the engine is set to the
+                # PARTIAL method this goes through the native standalone TP/SL
+                # endpoint, which takes tpQty/slQty - the position endpoint has
+                # no quantity field and can only ever close the whole position.
+                pct = max(1.0, min(99.0, self.state.partial_close_pct))
+                part = round_step(st.qty * pct / 100.0,
+                                  self.rules.get(sym, PairRules(sym)).base_precision)
+                if part > 0:
                     try:
-                        close_body = build_order_body(
-                            symbol=sym, qty=half,
-                            side="SELL" if side.upper() == "LONG" else "BUY",
-                            tradeSide="CLOSE", positionId=pid,
-                            orderType="MARKET", reduceOnly=True,
-                            rules=self.rules.get(sym),
-                            known_symbols=set(self.rules) or None,
-                        )
-                        await self.client.place_order(**close_body)
+                        if self.state.tpsl_method == "PARTIAL":
+                            res = await self.place_partial_tp_sl(
+                                sym, pid, side, part, st.tp, st.sl, rules)
+                            actions.append({"action": "partial_tpsl", "symbol": sym,
+                                            "qty": part, "pct": pct,
+                                            "roi": round(roi, 2), "result": res})
+                            self._log_tpsl({"event": "partial_tpsl", "ts": time.time(),
+                                            "symbol": sym, "position_id": pid,
+                                            "qty": part, "pct": pct,
+                                            "roi": round(roi, 2)})
+                        else:
+                            close_body = build_order_body(
+                                symbol=sym, qty=part,
+                                side="SELL" if side.upper() == "LONG" else "BUY",
+                                tradeSide="CLOSE", positionId=pid,
+                                orderType="MARKET", reduceOnly=True,
+                                rules=self.rules.get(sym),
+                                known_symbols=set(self.rules) or None,
+                            )
+                            await self.client.place_order(**close_body)
+                            actions.append({"action": "partial_close", "symbol": sym,
+                                            "qty": part, "roi": round(roi, 2)})
+                            self._log_trade({"event": "partial_close", "ts": time.time(),
+                                             "symbol": sym, "qty": part,
+                                             "roi": round(roi, 2)})
                         st.partial_done = True
-                        actions.append({"action": "partial_close", "symbol": sym,
-                                        "qty": half, "roi": round(roi, 2)})
-                        self._log_trade({"event": "partial_close", "ts": time.time(),
-                                         "symbol": sym, "qty": half, "roi": round(roi, 2)})
-                    except BitunixAPIError as e:
+                    except (BitunixAPIError, OrderValidationError, ValueError) as e:
                         self.state.errors.append(f"partial {sym}: {e}")
         # Management state (breakeven_done / trailing_stop / peak_roi) must hit
         # the disk even if the process is killed a moment later.
@@ -1209,6 +1408,9 @@ class TraderEngine:
         "min confidence", "tf min confidence", "positions history", "close position",
         "margin mode", "position mode", "symbols", "symbol ", "max open positions",
         "leverage", "risk ",
+        # the four documented TP/SL methods
+        "tpsl method", "partial close pct", "partial at roi",
+        "account tp usdt", "account sl usdt", "account tp pct", "account sl pct",
     )
 
     def looks_like_command(self, line: str) -> bool:
@@ -1392,6 +1594,53 @@ class TraderEngine:
                 return f"Leverage = {s.leverage}x (applied on next entry)."
             except (ValueError, IndexError):
                 return "Usage: leverage 10"
+        # ------------------------------------------------ the 4 TP/SL methods
+        if low.startswith("tpsl method"):
+            try:
+                m = arg("tpsl method").split()[-1].upper()
+            except IndexError:
+                return "Usage: tpsl method POSITION|PARTIAL|TRAILING|ACCOUNT"
+            if m not in ("POSITION", "PARTIAL", "TRAILING", "ACCOUNT"):
+                return "Method must be POSITION | PARTIAL | TRAILING | ACCOUNT"
+            s.tpsl_method = m
+            return self.tpsl_method_report()
+        if low.startswith("partial close pct"):
+            try:
+                s.partial_close_pct = max(1.0, min(99.0,
+                                                   float(arg("partial close pct").split()[-1])))
+                return f"Partial close = {s.partial_close_pct:g}% of the position."
+            except (ValueError, IndexError):
+                return "Usage: partial close pct 50"
+        if low.startswith("partial at roi"):
+            try:
+                s.partial_at_roi_pct = float(arg("partial at roi").split()[-1])
+                return f"Partial close fires at {s.partial_at_roi_pct:g}% ROI."
+            except (ValueError, IndexError):
+                return "Usage: partial at roi 50"
+        if low.startswith("account tp usdt"):
+            try:
+                s.account_tp_usdt = float(arg("account tp usdt").split()[-1])
+                return f"Account TP = +{s.account_tp_usdt:g} USDT (0 disables)."
+            except (ValueError, IndexError):
+                return "Usage: account tp usdt 100"
+        if low.startswith("account sl usdt"):
+            try:
+                s.account_sl_usdt = float(arg("account sl usdt").split()[-1])
+                return f"Account SL = -{s.account_sl_usdt:g} USDT (0 disables)."
+            except (ValueError, IndexError):
+                return "Usage: account sl usdt 50"
+        if low.startswith("account tp pct"):
+            try:
+                s.account_tp_pct = float(arg("account tp pct").split()[-1])
+                return f"Account TP = +{s.account_tp_pct:g}% of equity (0 disables)."
+            except (ValueError, IndexError):
+                return "Usage: account tp pct 5"
+        if low.startswith("account sl pct"):
+            try:
+                s.account_sl_pct = float(arg("account sl pct").split()[-1])
+                return f"Account SL = -{s.account_sl_pct:g}% of equity (0 disables)."
+            except (ValueError, IndexError):
+                return "Usage: account sl pct 3"
         if low.startswith("risk"):
             try:
                 s.risk_pct = float(arg("risk").split()[-1])

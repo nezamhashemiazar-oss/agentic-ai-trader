@@ -10,7 +10,9 @@ from jrock.trader.client import BitunixClient
 
 # client methods that are helpers, not endpoints
 HELPERS = {"start", "close", "sign", "request", "sync_time", "ping",
-           "verify_credentials", "_headers", "__aenter__", "__aexit__"}
+           "verify_credentials", "_headers", "__aenter__", "__aexit__",
+           # pure response post-processing, not an endpoint
+           "filter_funding_rows"}
 
 
 def client_endpoint_methods() -> set[str]:

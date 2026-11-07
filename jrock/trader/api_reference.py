@@ -83,11 +83,14 @@ _add(Endpoint("get_funding_rate", "GET", "/api/v1/futures/market/funding_rate", 
               "funding_rate.md"))
 _add(Endpoint("get_funding_rate_batch", "GET", "/api/v1/futures/market/funding_rate/batch", False,
               "10 req/sec/ip", "Funding rates for many symbols",
-              [_p("symbols", "string", True)], "funding_rate_batch.md"))
-_add(Endpoint("get_funding_rate_history", "GET", "/api/v1/futures/market/funding_rate/history",
-              False, "10 req/sec/ip", "Funding rate history",
-              [_p("symbol", "string", True), _p("page", "int", False),
-               _p("pageSize", "int", False)], "funding_rate_history.md"))
+              [_p("symbols", "string", False)], "funding_rate_batch.md"))
+_add(Endpoint("get_funding_rate_history", "GET",
+              "/api/v1/futures/market/get_funding_rate_history",
+              False, "10 req/sec/ip", "Funding rate history (note the get_ prefix)",
+              [_p("symbol", "string", True), _p("startTime", "int64", False),
+               _p("endTime", "int64", False),
+               _p("limit", "int", False, "default 100, max 200")],
+              "funding_rate_history.md"))
 _add(Endpoint("change_log", "GET", "/api/v1/futures/market/change_log", False,
               "10 req/sec/ip", "API changelog", [], "change_log.md"))
 
@@ -115,10 +118,12 @@ _add(Endpoint("get_leverage_and_margin_mode", "GET",
               [_p("symbol", "string", False), _p("marginCoin", "string", False)],
               "get_leverage_and_margin_mode.md"))
 _add(Endpoint("adjust_position_margin", "POST",
-              "/api/v1/futures/account/adjust_position_margin", True, "10 req/sec/uid",
-              "Add/remove isolated margin",
-              [_p("symbol", "string", True), _p("positionId", "string", True),
-               _p("amount", "string", True), _p("marginCoin", "string", True)],
+              "/api/v1/futures/account/adjust_position_margin", True, "5 req/sec/uid",
+              "Add/remove isolated margin (side OR positionId required)",
+              [_p("symbol", "string", True), _p("marginCoin", "string", True),
+               _p("amount", "string", True, "positive increases, negative reduces"),
+               _p("side", "string", False, "LONG | SHORT"),
+               _p("positionId", "string", False)],
               "adjust_position_margin.md"))
 _add(Endpoint("asset_query", "GET", "/api/v1/futures/copyTrading/asset/query", True,
               "10 req/sec/uid", "Copy-trading asset query",
@@ -157,8 +162,9 @@ _add(Endpoint("place_order", "POST", "/api/v1/futures/trade/place_order", True,
                _p("slOrderType", "string", False), _p("slOrderPrice", "string", False)],
               "place_order.md"))
 _add(Endpoint("batch_order", "POST", "/api/v1/futures/trade/batch_order", True,
-              "20 req/sec/uid", "Batch place orders",
-              [_p("orderList", "array", True)], "batch_order.md"))
+              "2 req/sec/uid", "Batch place orders (orderList max 5)",
+              [_p("symbol", "string", True), _p("orderList", "array", True)],
+              "batch_order.md"))
 _add(Endpoint("cancel_orders", "POST", "/api/v1/futures/trade/cancel_orders", True,
               "20 req/sec/uid", "Cancel specific orders",
               [_p("orderList", "array", True)], "cancel_orders.md"))
@@ -196,10 +202,15 @@ _add(Endpoint("flash_close_position", "POST", "/api/v1/futures/trade/flash_close
 
 # ------------------------------------------------------------------ tp/sl
 _add(Endpoint("place_tp_sl_order", "POST", "/api/v1/futures/tpsl/place_order", True,
-              "20 req/sec/uid", "Place a standalone TP/SL order",
-              [_p("symbol", "string", True), _p("positionId", "string", False),
-               _p("tpPrice", "string", False), _p("slPrice", "string", False)],
-              "place_tp_sl_order.md"))
+              "20 req/sec/uid", "Standalone TP/SL order - the PARTIAL method (tpQty/slQty)",
+              [_p("symbol", "string", True), _p("positionId", "string", True),
+               _p("tpPrice", "string", False), _p("tpStopType", "string", False,
+                                                  "LAST_PRICE | MARK_PRICE"),
+               _p("slPrice", "string", False), _p("slStopType", "string", False),
+               _p("tpOrderType", "string", False, "LIMIT | MARKET"),
+               _p("tpOrderPrice", "string", False), _p("slOrderType", "string", False),
+               _p("slOrderPrice", "string", False), _p("tpQty", "string", False),
+               _p("slQty", "string", False)], "place_tp_sl_order.md"))
 _add(Endpoint("place_position_tp_sl_order", "POST", "/api/v1/futures/tpsl/position/place_order",
               True, "20 req/sec/uid", "Attach TP/SL to a position (one per position)",
               [_p("symbol", "string", True), _p("positionId", "string", True),
@@ -208,25 +219,36 @@ _add(Endpoint("place_position_tp_sl_order", "POST", "/api/v1/futures/tpsl/positi
                _p("slPrice", "string", False), _p("slStopType", "string", False)],
               "place_position_tp_sl_order.md"))
 _add(Endpoint("modify_tp_sl_order", "POST", "/api/v1/futures/tpsl/modify_order", True,
-              "20 req/sec/uid", "Modify a TP/SL order",
+              "20 req/sec/uid", "Modify a standalone TP/SL order",
               [_p("orderId", "string", True), _p("tpPrice", "string", False),
-               _p("slPrice", "string", False)], "modify_tp_sl_order.md"))
+               _p("tpStopType", "string", False), _p("slPrice", "string", False),
+               _p("slStopType", "string", False), _p("tpOrderType", "string", False),
+               _p("tpOrderPrice", "string", False), _p("slOrderType", "string", False),
+               _p("slOrderPrice", "string", False), _p("tpQty", "string", False),
+               _p("slQty", "string", False)], "modify_tp_sl_order.md"))
 _add(Endpoint("modify_position_tp_sl_order", "POST",
               "/api/v1/futures/tpsl/position/modify_order", True, "20 req/sec/uid",
               "Modify a position's TP/SL (used for breakeven + trailing)",
               [_p("symbol", "string", True), _p("positionId", "string", True),
-               _p("tpPrice", "string", False), _p("slPrice", "string", False)],
+               _p("tpPrice", "string", False), _p("tpStopType", "string", False),
+               _p("slPrice", "string", False), _p("slStopType", "string", False)],
               "modify_position_tp_sl_order.md"))
 _add(Endpoint("cancel_tp_sl_order", "POST", "/api/v1/futures/tpsl/cancel_order", True,
-              "20 req/sec/uid", "Cancel a TP/SL order",
-              [_p("orderId", "string", True)], "cancel_tp_sl_order.md"))
-_add(Endpoint("get_pending_tp_sl_order", "GET", "/api/v1/futures/tpsl/get_pending_order", True,
-              "10 req/sec/uid", "Pending TP/SL orders",
-              [_p("symbol", "string", False)], "get_pending_tp_sl_order.md"))
-_add(Endpoint("get_history_tp_sl_order", "GET", "/api/v1/futures/tpsl/get_history_order", True,
-              "10 req/sec/uid", "TP/SL history",
-              [_p("symbol", "string", False), _p("page", "int", False),
-               _p("pageSize", "int", False)], "get_history_tp_sl_order.md"))
+              "10 req/sec/uid", "Cancel a TP/SL order (symbol AND orderId required)",
+              [_p("symbol", "string", True), _p("orderId", "string", True)],
+              "cancel_tp_sl_order.md"))
+_add(Endpoint("get_pending_tp_sl_order", "GET", "/api/v1/futures/tpsl/get_pending_orders", True,
+              "10 req/sec/uid", "Pending TP/SL orders (skip/limit, max 100)",
+              [_p("symbol", "string", False), _p("positionId", "string", False),
+               _p("side", "int32", False), _p("positionMode", "int32", False),
+               _p("skip", "int64", False), _p("limit", "int64", False)],
+              "get_pending_tp_sl_order.md"))
+_add(Endpoint("get_history_tp_sl_order", "GET", "/api/v1/futures/tpsl/get_history_orders", True,
+              "10 req/sec/uid", "TP/SL history (skip/limit, max 100)",
+              [_p("symbol", "string", False), _p("side", "int32", False),
+               _p("positionMode", "int32", False), _p("startTime", "int64", False),
+               _p("endTime", "int64", False), _p("skip", "int64", False),
+               _p("limit", "int64", False)], "get_history_tp_sl_order.md"))
 
 # ------------------------------------------------------------------ websocket
 WS_CHANNELS = {
