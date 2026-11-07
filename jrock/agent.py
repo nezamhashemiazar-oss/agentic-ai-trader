@@ -25,7 +25,8 @@ from .empty_response import (budget_warning, diagnose_empty, render_empty)
 from .memory import MemoryStore
 from .model_selector import autoset_model, persist_model
 from .permissions import PermissionManager
-from .settings_store import SettingsStore, mirror_env
+from .settings_store import mirror_env
+from .store import Store
 from .thinking import (DEFAULT_LEVEL, LEVEL_HELP, LEVELS, ONE_LINER,
                        build_reasoning_params, closest_level, describe_params,
                        normalize_level)
@@ -271,21 +272,46 @@ class JRockAgent:
             block_destructive=self.s.block_destructive,
         )
         self.tools = Tools(self.perms)
-        self.memory = MemoryStore(self.s.data_dir / "memory.jsonl")
-        self.store = SettingsStore(self.s.data_dir / "settings.json")
-        self.engine = TraderEngine(self.s)
+        self.store = Store(data_dir=self.s.data_dir)
+        self._register_secrets()
+        self.memory = MemoryStore(self.s.data_dir / "memory.jsonl",
+                                  max_items=getattr(self.s, "max_memory_items", 5000))
+        # Precedence: persisted store > .env > built-in default. Applied before
+        # the engine is built so every consumer sees the effective value.
+        self._apply_stored_settings()
+        self.engine = TraderEngine(self.s, store=self.store)
         self.engine.status_extra = lambda: [
             f"thinking={self.thinking_level}",
             f"market_data={self.s.market_data_source}",
             f"market_data_state={self.engine.market_data_report()}",
             f"price_cache={self._cache_line()}",
             f"kline_cache={self._kline_cache_line()}",
+            f"memory={self.memory.stats()['total']} entries "
+            f"({self.memory.stats()['size_bytes']}B)",
         ]
         self._ws_feed = None
         self.model: str = self.s.model
         self.mcp_servers: dict[str, str] = {}
         self.skills: dict[str, str] = {}
         self._load_registry()
+
+    # ---------------------------------------------------------- persistence
+    def _register_secrets(self) -> None:
+        """Teach the store which values must never reach disk."""
+        for v in (self.s.api_key, self.s.bitunix_api_key, self.s.bitunix_api_secret):
+            self.store.register_secret(v)
+
+    def _apply_stored_settings(self) -> None:
+        """Overlay persisted settings onto the .env-loaded Settings object."""
+        stored_src = self.store.get("market_data_source")
+        if stored_src in ("rest", "ws"):
+            if stored_src != self.s.market_data_source:
+                log.debug("market_data_source: store=%s overrides .env=%s",
+                          stored_src, self.s.market_data_source)
+            self.s.market_data_source = stored_src
+        stored_model = self.store.get("model")
+        if isinstance(stored_model, str) and stored_model:
+            self.s.model = stored_model
 
     # ------------------------------------------------------- thinking level
     @property
@@ -358,8 +384,39 @@ class JRockAgent:
         return f"Soul updated ({len(text)} chars appended)."
 
     # ------------------------------------------------------------ startup
+    def _state_banner(self) -> str:
+        """One honest line about what survived the restart, and from where."""
+        sm = self.store.summary()
+        mem = self.memory.stats()
+        if not sm["loaded"] and mem["total"] == 0 and not sm["recovered_backup"]:
+            return (f"State: fresh start (no store at {sm['path']})")
+        # Count what was actually restored, not just the agent-level settings
+        # dict: the engine's own settings live in their own section, so
+        # reporting only `settings` would say "0 settings" after a restart that
+        # in fact restored eight of them.
+        restored = self.engine.restored
+        n_settings = sm["settings"] + len(restored.get("settings") or [])
+        parts = [f"State: loaded {n_settings} settings, "
+                 f"{mem['total']} memory entries from {Path(sm['path']).parent}"]
+        if sm["migrated_from"]:
+            parts.append(f"  migrated store schema v{sm['migrated_from']} -> v{sm['version']}")
+        if sm["recovered_backup"]:
+            parts.append(f"  WARNING: previous store was corrupt; backed up to "
+                         f"{Path(sm['recovered_backup']).name} and started clean")
+        r = self.engine.restored
+        if r.get("positions"):
+            parts.append(f"  restored {r['positions']} position management state(s)")
+        if r.get("autotrade_was_on"):
+            parts.append("  WARNING: autotrade was ON before the restart - it is NOT "
+                         "auto-resumed. Run 'start trading' to re-enable.")
+        if r.get("engine_was_on"):
+            parts.append("  note: the engine loop was ON before the restart - "
+                         "run 'engine on' to resume scanning.")
+        return "\n".join(parts)
+
     async def startup(self) -> str:
         lines = ["J+Rock starting..."]
+        lines.append(self._state_banner())
         if not self.model:
             res = await autoset_model(self.s.base_url, self.s.api_key)
             lines.append(f"AutoSetModelByKey: {res.message}")
@@ -1120,17 +1177,54 @@ class JRockAgent:
         return "\n".join(lines)
 
     def cmd_memory(self, query: str) -> str:
-        if not query:
+        arg = (query or "").strip()
+        if arg.lower() in ("clear confirm", "wipe confirm", "reset confirm"):
+            return self.cmd_memory_clear_confirmed()
+        if arg.lower() in ("clear", "wipe", "reset"):
+            return self._memory_clear()
+        if not arg:
             st = self.memory.stats()
-            lines = [f"memory: {st['total']} items at {st['path']}",
-                     f"by kind: {st['by_kind']}", "recent:"]
+            last = (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st["last_write"]))
+                    if st["last_write"] else "never")
+            lines = [
+                "=== memory ===",
+                f"entries: {st['total']} / {st['max_items']} cap"
+                + (f"  (evicted {st['evicted']} so far)" if st["evicted"] else ""),
+                f"size on disk: {st['size_bytes']} bytes",
+                f"last write: {last}",
+                f"path: {st['path']}",
+                f"by kind: {st['by_kind']}",
+                "recent:",
+            ]
             for m in self.memory.recent(8):
-                lines.append(f"  [{m.kind}] {m.text[:120]}")
+                ts = time.strftime("%m-%d %H:%M", time.localtime(m.ts))
+                lines.append(f"  [{m.kind} w={m.weight} {ts}] {m.text[:110]}")
+            lines.append("")
+            lines.append("usage: /memory <query>   search")
+            lines.append("       /memory clear     wipe all memory (asks first)")
             return "\n".join(lines)
-        hits = self.memory.search(query, k=10)
+        hits = self.memory.search(arg, k=10)
         if not hits:
-            return f"no memory matches for {query!r}"
+            return f"no memory matches for {arg!r}"
         return "\n".join(f"[{m.kind} w={m.weight}] {m.text[:200]}" for m in hits)
+
+    def _memory_clear(self) -> str:
+        """Wipe memory. Requires an explicit confirmation token.
+
+        A destructive, irreversible action must not fire on a typo, so
+        `/memory clear` alone only asks; `/memory clear confirm` does it.
+        """
+        n = len(self.memory.items)
+        if n == 0:
+            return "memory is already empty."
+        return (f"memory holds {n} entries at {self.memory.path}.\n"
+                f"This cannot be undone. Re-run as:  /memory clear confirm")
+
+    def cmd_memory_clear_confirmed(self) -> str:
+        """Actually wipe memory - only reachable via `/memory clear confirm`."""
+        n = self.memory.clear()
+        self.perms.audit.write("memory_clear", entries=n)
+        return f"memory cleared: {n} entries removed from {self.memory.path}."
 
     def _py_files(self, path: str) -> list[Path]:
         base = Path(path) if path else ROOT / "jrock"

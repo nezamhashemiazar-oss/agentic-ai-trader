@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..config import Settings
+from ..store import Store
 from .aggregator import Aggregate, aggregate
 from .client import BitunixClient, BitunixConfig
 from .errors import BitunixAPIError
@@ -67,7 +68,8 @@ class EngineState:
 
 
 class TraderEngine:
-    def __init__(self, settings: Settings, data_dir: Path | None = None):
+    def __init__(self, settings: Settings, data_dir: Path | None = None,
+                 store: Store | None = None):
         self.s = settings
         self.data_dir = data_dir or settings.data_dir
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -113,8 +115,108 @@ class TraderEngine:
         self.trades_path = self.data_dir / "trades.jsonl"
         self.tpsl_path = self.data_dir / "tpsl.jsonl"
         self.signals_path = self.data_dir / "signals.jsonl"
+        # --- persistence: one store owns every durable value
+        self.store = store if store is not None else Store(data_dir=self.data_dir)
+        self._snapshot: dict[str, Any] = {}
+        if settings.bitunix_api_key:
+            self.store.register_secret(settings.bitunix_api_key)
+        if settings.bitunix_api_secret:
+            self.store.register_secret(settings.bitunix_api_secret)
+        self.restored = self._restore_from_store()
+        #: set on restore when autotrade was ON before the restart, so the
+        #: banner can say so out loud instead of silently resuming live orders.
+        self.autotrade_was_on: bool = False
+        #: set on restore when the engine loop was ON before the restart.
+        self.engine_was_on: bool = False
         # Optional hook so the agent can add its own settings to `status`.
         self.status_extra: Callable[[], list[str]] | None = None
+
+    # ============================================================== persistence
+    #: EngineState fields that survive a restart. Deliberately excludes
+    #: last_*_ts (wall-clock, meaningless later) and `errors` (kept as counters).
+    PERSISTED_STATE_FIELDS: tuple[str, ...] = (
+        "scan_on", "report_on", "report_interval", "scan_interval",
+        "reversal", "reversal_confidence", "mid_management",
+        "symbols", "leverage", "margin_mode", "position_mode",
+        "max_open_positions", "risk_pct", "breakeven_pct",
+        "trailing_trigger_roi_pct", "liq_sl_distance_pct",
+        "min_agreeing", "timeframes", "min_confidence", "tf_min_confidence",
+        "scans",
+    )
+
+    def _state_snapshot(self) -> dict[str, Any]:
+        """Everything whose change should trigger a save.
+
+        Includes `autotrade` and `engine_on` even though they are never
+        auto-resumed: toggling autotrade alone must still be recorded, or the
+        banner cannot warn that it was on before a crash.
+        """
+        snap = {f: getattr(self.state, f) for f in self.PERSISTED_STATE_FIELDS}
+        snap["autotrade"] = self.state.autotrade
+        snap["engine_on"] = self.state.engine_on
+        return snap
+
+    def _restore_from_store(self) -> dict[str, Any]:
+        """Apply persisted state over the .env-seeded defaults.
+
+        Precedence: store > .env > default. `autotrade` and `engine_on` are
+        intentionally NOT auto-resumed - see the note in `_persist_if_changed`.
+        """
+        saved = self.store.section("engine")
+        applied: list[str] = []
+        for field_name, value in saved.items():
+            if field_name in ("autotrade", "engine_on"):
+                continue
+            if field_name in self.PERSISTED_STATE_FIELDS:
+                try:
+                    setattr(self.state, field_name, value)
+                    applied.append(field_name)
+                except (TypeError, ValueError):
+                    continue
+        self.autotrade_was_on = bool(saved.get("autotrade"))
+        self.engine_was_on = bool(saved.get("engine_on"))
+
+        # positions
+        raw_pos = self.store.section("positions")
+        for pid, body in raw_pos.items():
+            try:
+                self.positions[pid] = PositionState(**body)
+            except TypeError:
+                continue
+
+        # counters
+        saved_counters = self.store.section("counters")
+        self.state.scans = int(saved_counters.get("scans", self.state.scans) or 0)
+
+        self._snapshot = self._state_snapshot()
+        return {"settings": applied, "positions": len(self.positions),
+                "scans": self.state.scans,
+                "autotrade_was_on": self.autotrade_was_on,
+                "engine_was_on": self.engine_was_on,
+                "from": self.store.loaded_from if self.store.loaded else ""}
+
+    def _persist_if_changed(self) -> None:
+        """Save engine state if any persisted field moved.
+
+        Called after every command, so a runtime change hits the disk in the
+        same call - `kill -9` one millisecond later cannot lose it. autotrade
+        and engine_on are recorded as *desired* state only and are never
+        resumed automatically: silently restarting live order flow after a
+        crash is exactly the failure mode this project must not have.
+        """
+        snap = self._state_snapshot()
+        if snap == self._snapshot:
+            return
+        self.store.set_section("engine", {
+            **snap,
+            "autotrade": self.state.autotrade,
+            "engine_on": self.state.engine_on,
+        }, save=False)
+        self.store.counters = {"scans": self.state.scans,
+                               "errors": len(self.state.errors),
+                               "last_error": self.state.errors[-1] if self.state.errors else ""}
+        self.store.save()
+        self._snapshot = snap
 
     # ================================================================ lifecycle
     async def start(self) -> None:
@@ -239,6 +341,31 @@ class TraderEngine:
                     self.price_cache.put_rest(symbol, px)
                 return px
         return 0.0
+
+    def persist_positions(self) -> None:
+        """Mirror the in-memory position-management state to the store.
+
+        Without this, a restart forgets `breakeven_done`, `trailing_stop` and
+        `peak_roi`, so the engine would re-arm breakeven and re-tighten a
+        trailing stop it had already tightened - acting on a trade it believed
+        was fresh. The exchange is still the source of truth for the position
+        itself; this is the management state on top of it.
+        """
+        body: dict[str, dict] = {}
+        for pid, st in self.positions.items():
+            body[pid] = {
+                "position_id": st.position_id, "symbol": st.symbol,
+                "side": st.side, "entry": st.entry, "qty": st.qty,
+                "leverage": st.leverage, "sl": st.sl, "tp": st.tp,
+                "liq": st.liq, "breakeven_done": st.breakeven_done,
+                "trailing_active": st.trailing_active,
+                "trailing_stop": st.trailing_stop,
+                "partial_done": st.partial_done,
+                "opened_ts": st.opened_ts, "peak_roi": st.peak_roi,
+            }
+        if body == self.store.section("positions"):
+            return
+        self.store.set_section("positions", body)
 
     def _spawn(self, coro, name: str) -> None:
         t = asyncio.create_task(coro, name=name)
@@ -567,6 +694,7 @@ class TraderEngine:
                     opened_ts=time.time(),
                 )
                 break
+        self.persist_positions()
 
         return {"ok": True, "order_id": order_id, "symbol": sym, "side": side,
                 "qty": qty, "entry": price, "plan": plan.as_dict()}
@@ -580,6 +708,9 @@ class TraderEngine:
                 res = await self.client.close_all_position(symbol)
             self._log_trade({"event": "close", "ts": time.time(),
                              "symbol": symbol, "position_id": position_id, "result": res})
+            if position_id:
+                self.positions.pop(str(position_id), None)
+            self.persist_positions()
             return {"ok": True, "result": res}
         except BitunixAPIError as e:
             return {"ok": False, "reason": str(e), "hint": e.hint}
@@ -699,6 +830,9 @@ class TraderEngine:
                                          "symbol": sym, "qty": half, "roi": round(roi, 2)})
                     except BitunixAPIError as e:
                         self.state.errors.append(f"partial {sym}: {e}")
+        # Management state (breakeven_done / trailing_stop / peak_roi) must hit
+        # the disk even if the process is killed a moment later.
+        self.persist_positions()
         return actions
 
     # ================================================================ reporting
@@ -794,6 +928,21 @@ class TraderEngine:
             return []
 
     # ================================================================ settings
+    def store_line(self) -> str:
+        """One honest line about persistence for `/status`."""
+        sm = self.store.summary()
+        last = (time.strftime("%H:%M:%S", time.localtime(sm["last_save"]))
+                if sm["last_save"] else "never")
+        extra = ""
+        if sm["migrated_from"]:
+            extra += f" migrated_from=v{sm['migrated_from']}"
+        if sm["recovered_backup"]:
+            extra += f" CORRUPT_BACKUP={Path(sm['recovered_backup']).name}"
+        return (f"store: {sm['path']} schema=v{sm['version']} "
+                f"settings={sm['settings'] + sm['engine_settings']} "
+                f"positions={sm['positions']} "
+                f"size={sm['size_bytes']}B last_save={last}{extra}")
+
     def settings_report(self) -> str:
         s = self.state
         return "\n".join([
@@ -843,6 +992,17 @@ class TraderEngine:
         return any(low.startswith(p) for p in self.COMMAND_PREFIXES)
 
     async def command(self, line: str) -> str:
+        """Route an engine command, persisting any state it changed.
+
+        The persistence wrapper is here rather than in each of the ~25 branches
+        so that a future branch cannot forget it.
+        """
+        try:
+            return await self._command(line)
+        finally:
+            self._persist_if_changed()
+
+    async def _command(self, line: str) -> str:
         """Route an engine command. Returns a human-readable result."""
         raw = line.strip()
         if not raw:
@@ -1021,6 +1181,7 @@ class TraderEngine:
             f"open positions: {len(positions)}",
             f"scans={s.scans} last_scan={time.strftime('%H:%M:%S', time.localtime(s.last_scan_ts)) if s.last_scan_ts else 'never'}",
             f"errors={len(s.errors)}" + (f" last={s.errors[-1]}" if s.errors else ""),
+            self.store_line(),
         ]
         if self.status_extra:
             try:

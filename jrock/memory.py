@@ -6,15 +6,33 @@ Stores:
   * fact      - durable project facts (symbols, settings, decisions)
 
 Retrieval is a simple BM25-ish keyword score; no external deps.
+
+Durability
+----------
+Appends are flushed + fsynced immediately, so a ``kill -9`` after ``add()``
+cannot lose the entry. The file is *bounded*: once it exceeds ``max_items`` the
+oldest entries are evicted by a weighted score (low weight first, then oldest),
+and the surviving set is rewritten atomically so the file cannot grow without
+limit and cannot be left half-written.
+
+Eviction is weighted, not pure FIFO: a ``fact`` (weight 3.0) or a user
+``feedback`` (weight 3.0) outlives a routine ``episode`` (weight 1.0) of the
+same age, because the cheap chatter is what should be dropped first.
 """
 from __future__ import annotations
 
 import json
+import logging
 import math
+import os
 import re
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+
+from .store import atomic_write_text
+
+log = logging.getLogger("jrock.memory")
 
 _TOKEN = re.compile(r"[a-z0-9_]+")
 
@@ -33,11 +51,20 @@ class MemoryItem:
     meta: dict = field(default_factory=dict)
 
 
+#: Upper bound on retained entries. Beyond this the oldest low-weight entries
+#: are evicted. Sized so the file stays a few MB at worst.
+DEFAULT_MAX_ITEMS = 5000
+
+
 class MemoryStore:
-    def __init__(self, path: Path | str = "data/memory.jsonl"):
+    def __init__(self, path: Path | str = "data/memory.jsonl",
+                 max_items: int = DEFAULT_MAX_ITEMS):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.max_items = max(1, int(max_items))
         self.items: list[MemoryItem] = []
+        self.evicted: int = 0
+        self.last_write_ts: float = 0.0
         self._load()
 
     def _load(self) -> None:
@@ -57,9 +84,53 @@ class MemoryStore:
             tags: list[str] | None = None, meta: dict | None = None) -> MemoryItem:
         item = MemoryItem(kind=kind, text=text, weight=weight, tags=tags or [], meta=meta or {})
         self.items.append(item)
-        with self.path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(asdict(item), ensure_ascii=False) + "\n")
+        self._append_durable(item)
+        if len(self.items) > self.max_items:
+            self._evict()
         return item
+
+    def _append_durable(self, item: MemoryItem) -> None:
+        """Append one JSON line and fsync it - survives kill -9 immediately."""
+        line = json.dumps(asdict(item), ensure_ascii=False) + "\n"
+        with self.path.open("a", encoding="utf-8") as fh:
+            fh.write(line)
+            fh.flush()
+            os.fsync(fh.fileno())
+        self.last_write_ts = time.time()
+
+    def _evict(self) -> None:
+        """Drop the weakest entries until we are back at the cap.
+
+        Ranking: keep high weight; among equal weights keep the newest. The
+        survivors are written atomically, so a crash mid-eviction leaves the
+        previous (valid) file intact.
+        """
+        excess = len(self.items) - self.max_items
+        if excess <= 0:
+            return
+        # newest-first for ties, so the oldest equal-weight entry is dropped first
+        order = sorted(self.items, key=lambda i: (i.weight, i.ts), reverse=True)
+        keep = order[: self.max_items]
+        # restore chronological order for stable reads
+        keep.sort(key=lambda i: i.ts)
+        self.items = keep
+        self.evicted += excess
+        self._rewrite()
+        log.debug("memory evicted %d entries, %d remain", excess, len(self.items))
+
+    def _rewrite(self) -> None:
+        body = "".join(json.dumps(asdict(i), ensure_ascii=False) + "\n"
+                       for i in self.items)
+        atomic_write_text(self.path, body)
+        self.last_write_ts = time.time()
+
+    def clear(self) -> int:
+        """Wipe all memory. Returns how many entries were removed."""
+        n = len(self.items)
+        self.items = []
+        atomic_write_text(self.path, "")
+        self.last_write_ts = time.time()
+        return n
 
     def feedback(self, text: str, weight: float = 2.0, tags: list[str] | None = None) -> MemoryItem:
         return self.add("feedback", text, weight=weight, tags=tags)
@@ -103,7 +174,10 @@ class MemoryStore:
         by_kind: dict[str, int] = {}
         for i in self.items:
             by_kind[i.kind] = by_kind.get(i.kind, 0) + 1
-        return {"total": len(self.items), "by_kind": by_kind, "path": str(self.path)}
+        return {"total": len(self.items), "by_kind": by_kind, "path": str(self.path),
+                "max_items": self.max_items, "evicted": self.evicted,
+                "size_bytes": self.path.stat().st_size if self.path.exists() else 0,
+                "last_write": self.last_write_ts}
 
     def recent(self, n: int = 10) -> list[MemoryItem]:
         return self.items[-n:]

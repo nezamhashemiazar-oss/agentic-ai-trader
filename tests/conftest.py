@@ -20,10 +20,20 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _isolate_repo(tmp_path, monkeypatch):
-    """Point ROOT at a temp dir and clear env vars that leak between tests."""
+    """Point ROOT at a temp dir and clear env vars that leak between tests.
+
+    BOTH `jrock.agent.ROOT` and `jrock.config.ROOT` must be patched.
+    `Settings.data_dir` is a property that reads the module-level `ROOT` from
+    `jrock.config`, so patching only the agent's copy left every store and
+    memory file pointing at the repo's real `data/` - which is how a test run
+    once loaded 688 real memory entries and a persisted
+    `market_data_source=ws` into a test that expected `rest`.
+    """
     monkeypatch.setattr("jrock.agent.ROOT", tmp_path)
+    monkeypatch.setattr("jrock.config.ROOT", tmp_path)
     monkeypatch.delenv("THINKING_LEVEL", raising=False)
     monkeypatch.delenv("FREE_ONLY", raising=False)
+    monkeypatch.delenv("MARKET_DATA_SOURCE", raising=False)
     yield
 
 

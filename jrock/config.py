@@ -128,6 +128,7 @@ def load_settings(env_file: str | os.PathLike | None = None) -> Settings:
         price_max_age_sec=_f("PRICE_MAX_AGE_SEC", 5.0),
         kline_max_age_mult=_f("KLINE_MAX_AGE_SEC", 2.0),
         kline_cache_max=_i("KLINE_CACHE_MAX", 500),
+        max_memory_items=_i("MAX_MEMORY_ITEMS", 5000),
     )
 
 

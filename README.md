@@ -502,18 +502,71 @@ a reconnect.
 
 ---
 
+## Persistence
+
+Settings and learned state survive a restart. One module owns it all:
+`jrock/store.py`, backed by `data/state.json` (versioned) and
+`data/memory.jsonl` (bounded).
+
+**Precedence is explicit: persisted store > `.env` > built-in default.** A
+value changed at runtime is written to disk *in the same call*, so `kill -9`
+cannot lose it. `.env` is kept in sync as a convenience mirror only — it can
+never win over the store.
+
+What is persisted: every runtime-settable engine value (leverage, risk params,
+symbols, timeframes, scan/report intervals, mid-management, reversal, …), the
+agent's thinking level and market-data source, position management state
+(`breakeven_done`, `trailing_stop`, `peak_roi`, `partial_done`), counters, and
+the learned memory (feedback / episodes / facts).
+
+**Autotrade and the engine loop are recorded but never auto-resumed.** After a
+crash the banner says so out loud; you re-enable deliberately with
+`start trading`. Silently restarting live order flow is the one failure mode
+this engine must not have.
+
+Safety properties:
+
+- **Atomic writes** — temp file + `fsync` + `os.replace` + directory `fsync`.
+  A crash mid-write leaves the old file or the new one, never a partial one.
+- **Schema versioning** — a `version` field with a migration path. A v1 file is
+  upgraded in place, not discarded.
+- **Corruption recovery** — an unreadable file is backed up to
+  `state.json.corrupt-<timestamp>`, a warning is logged, and the engine starts
+  clean. It never crashes on startup and never silently wipes.
+- **Secrets never touch disk** — secret key names are refused outright, and any
+  registered secret *value* found in the payload aborts the write. API keys
+  live in `.env` only.
+
+```
+/memory              entry count, size on disk, last write, recent entries
+/memory <query>      search
+/memory clear        asks first; /memory clear confirm wipes
+/status              store path, schema version, last save, size
+```
+
+Verify it yourself:
+
+```bash
+python scripts/verify_store.py     # SIGKILL, precedence, corruption, migration, secret scan
+python scripts/verify_restart.py   # the same through the real agent command path
+```
+
+---
+
 ## Tests
 
 ```bash
 python -m pytest -q tests
 ```
 
-249 tests covering indicators, risk math, all 16 strategies (including empty and
+344 tests covering indicators, risk math, all 16 strategies (including empty and
 short-data inputs), aggregation rules, TP/SL planning, API-reference/client
 drift, model probing, request signing, CLI routing, the thinking-level system
 (levels, aliases, persistence, and the exact request parameter sent), the
-balance command, empty-model-response diagnosis, and the order builder's
-per-field validation.
+balance command, empty-model-response diagnosis, the order builder's per-field
+validation, the price and kline caches, the WebSocket layer, and the persistent
+store (round-trip, SIGKILL survival, precedence, atomicity, corruption
+recovery, schema migration, memory eviction, and the secret guard).
 
 ---
 
