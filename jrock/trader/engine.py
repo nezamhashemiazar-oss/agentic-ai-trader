@@ -33,9 +33,10 @@ from .order_builder import (OrderValidationError, build_order_body,
                             debug_order_enabled, log_order_body)
 from .price_cache import PriceCache
 from .risk import (PairRules, Tier, TpSlSideError, clamp_sl, clamp_tp,
-                   format_price, format_qty, margin_required, pick_tier,
-                   position_size_by_risk, qty_from_notional, qty_from_unit,
-                   roi_pct, round_price, round_step, tick_size, unit_from_qty,
+                   fee_for_notional, format_price, format_qty, margin_required,
+                   max_notional_for_balance, pick_tier, position_size_by_risk,
+                   qty_from_notional, qty_from_unit, required_cost, roi_pct,
+                   round_price, round_step, tick_size, unit_from_qty,
                    validate_tpsl_side)
 from .strategies import build_strategies
 from .tpsl import (PositionState, mid_management_action, next_trailing_stop,
@@ -815,7 +816,9 @@ class TraderEngine:
             return {"ok": False, "reason": f"cannot place a valid stop-loss: {e}"}
 
         qty = position_size_by_risk(equity, self.state.risk_pct, price, plan.sl,
-                                    self.state.leverage, rules)
+                                    self.state.leverage, rules,
+                                    fee_rate=self.s.taker_fee_rate,
+                                    safety_pct=self.s.margin_safety_pct)
         if qty <= 0:
             return {"ok": False, "reason": "computed qty is 0 (risk too small or below min volume)"}
 
@@ -838,13 +841,26 @@ class TraderEngine:
         # sent and the exchange answers 20003 Insufficient balance.
         notional_real = qty * price
         margin_real = margin_required(notional_real, self.state.leverage)
+        # Opening a MARKET order costs the initial margin AND a taker fee, and
+        # the exchange deducts BOTH from the available balance at once. Checking
+        # only the margin let `margin == equity` pass locally and then fail on
+        # the exchange with 20003 once the fee was added.
+        fee_real = fee_for_notional(notional_real, self.s.taker_fee_rate)
+        required_real = margin_real + fee_real
+        # Reserve the configured headroom so a price move between sizing and the
+        # request landing cannot push the cost back over the balance.
+        usable_equity = equity * (1.0 - max(0.0, min(0.9, self.s.margin_safety_pct / 100.0)))
 
-        if margin_real > equity:
-            msg = (f"required margin {margin_real:.4f} USDT exceeds available "
-                   f"balance {equity:.4f} USDT for {sym} "
-                   f"(qty={qty}, notional={notional_real:.4f}, "
-                   f"leverage={self.state.leverage}x). "
-                   f"Lower the leverage, lower risk_pct, or add funds.")
+        if required_real > usable_equity:
+            msg = (f"insufficient balance for {sym}: required {required_real:.4f} USDT "
+                   f"(margin {margin_real:.4f} + fee {fee_real:.4f}) vs available "
+                   f"{equity:.4f} USDT"
+                   + (f" (usable {usable_equity:.4f} after "
+                      f"MARGIN_SAFETY_PCT={self.s.margin_safety_pct:g}%)"
+                      if self.s.margin_safety_pct else "")
+                   + f" for qty={qty}, notional={notional_real:.4f} at "
+                     f"{self.state.leverage}x. Lower the leverage, lower risk_pct, "
+                     f"or add funds.")
             self.state.errors.append(f"preflight {sym}: {msg}")
             return {"ok": False, "reason": msg, "hint": "20003 Insufficient balance"}
         if self.s.min_margin_usdt and margin_real < self.s.min_margin_usdt:
@@ -1668,6 +1684,11 @@ class TraderEngine:
             f"min_conf={s.min_confidence} tf_min_conf={s.tf_min_confidence}",
             f"scan_interval={s.scan_interval}s report_interval={s.report_interval}s "
             f"reversal={s.reversal} reversal_conf={s.reversal_confidence}",
+            f"tpsl_min_stop_ticks={self.s.tpsl_min_stop_ticks} "
+            f"({self.s.tpsl_min_stop_ticks} x tick = "
+            f"{self.s.tpsl_min_stop_ticks * 10.0 ** -6:.6f} on a 6-dp symbol) "
+            f"taker_fee={self.s.taker_fee_rate * 100:g}% "
+            f"margin_safety={self.s.margin_safety_pct:g}%",
             f"scans={s.scans} errors={len(s.errors)}",
         ])
 

@@ -106,6 +106,15 @@ class Settings:
     min_margin_usdt: float = 0.0
     max_margin_usdt: float = 0.0
     max_notional_usdt: float = 0.0
+    #: Taker fee rate charged on a MARKET order, as a fraction of notional.
+    #: Bitunix USDT-M futures VIP 0 is 0.0006 (0.06%). The engine must reserve
+    #: this on top of the initial margin, because the exchange deducts both from
+    #: the available balance at once - sizing to margin == balance is what
+    #: produced 20003 Insufficient balance.
+    taker_fee_rate: float = 0.0006
+    #: Extra headroom reserved when sizing, as a percent of available balance.
+    #: Covers the price move between sizing and the request landing. 0 disables.
+    margin_safety_pct: float = 2.0
     #: Hard cap on learned-memory entries. The store evicts by weight once the
     #: cap is reached, so the file cannot grow without bound.
     max_memory_items: int = 5000
@@ -210,6 +219,8 @@ def load_settings(env_file: str | os.PathLike | None = None) -> Settings:
         min_margin_usdt=_f("MIN_MARGIN_USDT", 0.0),
         max_margin_usdt=_f("MAX_MARGIN_USDT", 0.0),
         max_notional_usdt=_f("MAX_NOTIONAL_USDT", 0.0),
+        taker_fee_rate=_f("TAKER_FEE_RATE", 0.0006),
+        margin_safety_pct=_f("MARGIN_SAFETY_PCT", 2.0),
         max_memory_items=_i("MAX_MEMORY_ITEMS", 5000),
         tp_ladder=os.getenv("TP_LADDER", "").strip(),
         tp_ladder_breakeven_after=_i("TP_LADDER_BREAKEVEN_AFTER", 1),

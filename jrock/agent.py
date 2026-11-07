@@ -108,6 +108,18 @@ TRADER ENGINE COMMANDS
   ladder basis R|ROI|PRICE          ladder
   margin add BTCUSDT 100            margin reduce BTCUSDT 50
 
+ENV SETTINGS (in .env, read at startup)
+  TP_SL_MIN_STOP_TICKS=3    minimum gap, in price ticks, that a TP/SL must keep
+                            from the mark/entry price. 1 tick = 10^-quotePrecision
+                            (AKEUSDT has quotePrecision 6, so 1 tick = 0.000001).
+                            Enforced in plan_tpsl() and clamp_sl()/clamp_tp().
+                            Higher = safer against 30029/30031 but a wider stop;
+                            lower = tighter stop, more likely to be rejected.
+  TAKER_FEE_RATE=0.0006     taker fee (0.06%) reserved on top of margin when
+                            sizing, so an order never asks for more than the
+                            balance can pay for (20003 Insufficient balance).
+  MARGIN_SAFETY_PCT=2       extra headroom reserved when sizing, % of balance.
+
 PERMISSIONS
   auto accept edit on|off    apply self-edits automatically vs. show diff
   device access on|off       grant whole-terminal access

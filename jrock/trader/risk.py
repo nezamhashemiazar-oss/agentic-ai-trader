@@ -163,6 +163,52 @@ def margin_required(notional: float, leverage: int) -> float:
     return notional / max(1, leverage)
 
 
+#: Bitunix USDT-M futures taker fee at VIP 0, as a fraction of notional.
+#: A MARKET order is always a taker order, so this is charged on ENTRY and is
+#: deducted from the available balance at the same moment the margin is locked.
+#: Ignoring it is what produced 20003: the engine sized the order so that
+#: margin == available balance exactly, the local pre-flight passed (it only
+#: compared margin), and the exchange then wanted margin + fee and refused.
+TAKER_FEE_RATE = 0.0006
+
+
+def fee_for_notional(notional: float, fee_rate: float = TAKER_FEE_RATE) -> float:
+    """Entry fee charged on a MARKET order of `notional` USDT."""
+    return max(0.0, notional) * max(0.0, fee_rate)
+
+
+def max_notional_for_balance(equity: float, leverage: int,
+                             fee_rate: float = TAKER_FEE_RATE,
+                             safety_pct: float = 0.0) -> float:
+    """Largest notional whose margin PLUS entry fee still fits `equity`.
+
+    Opening a position costs ``notional/leverage`` of margin and
+    ``notional*fee_rate`` of taker fee, both taken from the available balance::
+
+        notional/leverage + notional*fee_rate <= equity
+        notional <= equity / (1/leverage + fee_rate)
+
+    `safety_pct` reserves extra headroom (percent of equity) so a price move
+    between sizing and the request landing cannot push the cost back over the
+    balance. Without the fee term this returns ``equity*leverage``, which is
+    exactly the value that made margin == equity and triggered 20003.
+    """
+    if equity <= 0 or leverage <= 0:
+        return 0.0
+    lev = max(1, int(leverage))
+    usable = equity * (1.0 - max(0.0, min(0.9, safety_pct / 100.0)))
+    denom = 1.0 / lev + max(0.0, fee_rate)
+    if denom <= 0:
+        return 0.0
+    return usable / denom
+
+
+def required_cost(notional: float, leverage: int,
+                  fee_rate: float = TAKER_FEE_RATE) -> float:
+    """Total balance an order consumes: initial margin + entry fee."""
+    return margin_required(notional, leverage) + fee_for_notional(notional, fee_rate)
+
+
 #: The three order units Bitunix documents in
 #: "Explanation of the Order Units in Futures Trading":
 #:   QUANTITY - base-coin quantity (the `qty` field of place_order)
@@ -256,14 +302,23 @@ def roi_pct(entry: float, price: float, side: str, leverage: int) -> float:
 
 
 def position_size_by_risk(equity: float, risk_pct: float, entry: float,
-                          stop: float, leverage: int, rules: PairRules) -> float:
-    """Size so that hitting the stop loses ~risk_pct of equity."""
+                          stop: float, leverage: int, rules: PairRules,
+                          fee_rate: float = TAKER_FEE_RATE,
+                          safety_pct: float = 0.0) -> float:
+    """Size so that hitting the stop loses ~risk_pct of equity.
+
+    The size is capped by what the balance can actually PAY FOR, not by
+    ``equity * leverage``. Opening a MARKET order costs margin AND a taker fee,
+    so the cap is ``max_notional_for_balance`` - using ``equity * leverage``
+    made margin equal the whole balance, the local pre-flight passed, and the
+    exchange rejected the order with 20003 once it added the fee.
+    """
     stop_dist = abs(entry - stop)
     if stop_dist <= 0 or entry <= 0:
         return 0.0
     risk_usd = equity * (risk_pct / 100.0)
     qty = risk_usd / stop_dist
-    max_notional = equity * leverage
+    max_notional = max_notional_for_balance(equity, leverage, fee_rate, safety_pct)
     qty = min(qty, max_notional / entry)
     qty = round_step(qty, rules.base_precision)
     if qty < rules.min_trade_volume:
