@@ -279,6 +279,7 @@ class JRockAgent:
             f"market_data={self.s.market_data_source}",
             f"market_data_state={self.engine.market_data_report()}",
             f"price_cache={self._cache_line()}",
+            f"kline_cache={self._kline_cache_line()}",
         ]
         self._ws_feed = None
         self.model: str = self.s.model
@@ -379,6 +380,11 @@ class JRockAgent:
         if self.s.market_data_source == "ws" and not self.engine.feed_connected():
             lines.append("  WARNING: MARKET_DATA_SOURCE=ws but the feed is NOT connected. "
                          "The engine is running on REST fallback.")
+        if self.s.market_data_source == "ws" and self.engine.feed_connected():
+            lines.append(f"  kline warmup: {self.engine.kline_warmup_calls} REST calls "
+                         f"for {len(self.engine.kline_keys())} (symbol, interval) keys")
+            for w in self.engine.kline_subscription_warnings():
+                lines.append(f"  WARNING: {w}")
         lines.append(f"Permissions: auto_accept_edit={self.perms.auto_accept_edit} "
                      f"device_access={self.perms.full_device_access}")
         return "\n".join(lines)
@@ -821,6 +827,17 @@ class JRockAgent:
                 f"rest_fallbacks={st.rest_fallbacks} ws_updates={st.ws_updates} "
                 f"rest_calls={self.engine.rest_price_calls}")
 
+    def _kline_cache_line(self) -> str:
+        """Compact kline cache counters for /status."""
+        c = self.engine.kline_cache
+        st = c.stats
+        return (f"keys={len(c.keys())} hits={st.hits} misses={st.misses} "
+                f"stale={st.stale_rejections} short={st.short_series} "
+                f"rest_fallbacks={st.rest_fallbacks} ws_updates={st.ws_updates} "
+                f"replaced={st.replaced} appended={st.appended} "
+                f"rest_kline_calls={self.engine.rest_kline_calls} "
+                f"warmup={self.engine.kline_warmup_calls}")
+
     def _ws_status(self) -> str:
         from .trader.ws import WSConfig, PUBLIC_CHANNELS, PRIVATE_CHANNELS
 
@@ -864,6 +881,9 @@ class JRockAgent:
             q = c.peek(sym)
             if q:
                 lines.append(f"  {sym}: {q.price} src={q.source} age={q.age():.1f}s")
+
+        # --- kline cache: the part that decides whether scans still poll REST
+        lines += ["", "--- kline cache ---", self.engine.kline_cache_report()]
 
         lines += ["", "public channels:  " + ", ".join(sorted(set(PUBLIC_CHANNELS.values()))),
                   "private channels: " + ", ".join(sorted(set(PRIVATE_CHANNELS.values())))]

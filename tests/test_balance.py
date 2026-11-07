@@ -35,6 +35,23 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+def _handle(a: JRockAgent, word: str) -> str:
+    """Run `a.handle(word)` and always close the REST session.
+
+    `JRockAgent` builds a real `BitunixClient`, which opens an aiohttp session
+    on first use. A routing test that calls `handle("price")` therefore makes a
+    real network call - and without this the session leaks, which is what
+    produced the `Unclosed client session` warnings in the suite.
+    """
+    async def _main():
+        try:
+            return await a.handle(word)
+        finally:
+            await a.engine.client.close()
+
+    return asyncio.run(_main())
+
+
 # ------------------------------------------------------------ account parsing
 def test_parse_accounts_reads_documented_fields():
     accts = parse_accounts(MOCK_ACCOUNT)
@@ -195,7 +212,7 @@ def test_trader_words_route_to_real_handlers(word, expected):
 def test_trader_words_never_reach_the_model(tmp_path, word):
     """The exact bug: these used to fall through to chat()."""
     a = _agent(tmp_path, bitunix_api_key="", bitunix_api_secret="")
-    out = _run(a.handle(word))
+    out = _handle(a, word)
     assert "You said" not in out, f"{word!r} reached the model"
     assert "I could not send that to a model" not in out
 

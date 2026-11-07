@@ -22,6 +22,7 @@ from .aggregator import Aggregate, aggregate
 from .client import BitunixClient, BitunixConfig
 from .errors import BitunixAPIError
 from .indicators import atr, to_candles
+from .kline_cache import REST_KLINE_MAX, KlineCache
 from .order_builder import (OrderValidationError, build_order_body,
                             debug_order_enabled, log_order_body)
 from .price_cache import PriceCache
@@ -101,10 +102,14 @@ class TraderEngine:
         self._stop = asyncio.Event()
         # --- market data: one cache, one optional WS feed, one REST counter
         self.price_cache = PriceCache(max_age=settings.price_max_age_sec)
+        self.kline_cache = KlineCache(max_age_mult=settings.kline_max_age_mult,
+                                      max_candles=settings.kline_cache_max)
         self.feed: MarketDataFeed | None = None
         self.feed_error: str = ""
         self.feed_started_at: float = 0.0
         self.rest_price_calls: int = 0
+        self.rest_kline_calls: int = 0
+        self.kline_warmup_calls: int = 0
         self.trades_path = self.data_dir / "trades.jsonl"
         self.tpsl_path = self.data_dir / "tpsl.jsonl"
         self.signals_path = self.data_dir / "signals.jsonl"
@@ -140,8 +145,9 @@ class TraderEngine:
         if not symbols:
             return
         cfg = WSConfig.from_settings(self.s)
-        self.feed = MarketDataFeed(cfg, symbols, self.state.timeframes,
-                                   cache=self.price_cache)
+        self.feed = MarketDataFeed(cfg, symbols, self.kline_timeframes(),
+                                   cache=self.price_cache,
+                                   kline_cache=self.kline_cache)
         self.feed_started_at = time.time()
         try:
             await self.feed.start()
@@ -151,6 +157,10 @@ class TraderEngine:
                 if self.feed.ws.connected:
                     break
                 await asyncio.sleep(0.1)
+            # Seed the kline cache from REST once. The WS only gives candles
+            # from the moment we subscribe, so without this a 200-candle
+            # strategy would need 200 minutes of uptime before it could run.
+            await self.warmup_klines()
         except Exception as e:  # noqa: BLE001
             self.feed_error = f"{type(e).__name__}: {e}"
             log.warning("ws feed failed to start: %s - falling back to REST", e)
@@ -277,9 +287,101 @@ class TraderEngine:
             self.state.errors.append(f"load_tiers {symbol}: {e}")
             return []
 
+    def kline_timeframes(self) -> list[str]:
+        """Every interval the engine reads candles on.
+
+        Derived from the configured timeframes, not a hardcoded list. The
+        trailing-stop ATR reads 5m, so 5m is always included - otherwise that
+        one read would poll REST forever while everything else used the cache.
+        """
+        tfs = list(self.state.timeframes)
+        if "5m" not in tfs:
+            tfs.append("5m")
+        return tfs
+
+    def kline_keys(self) -> list[tuple[str, str]]:
+        """Every (symbol, interval) the engine actually needs."""
+        out: list[tuple[str, str]] = []
+        for sym in self._feed_symbols():
+            for tf in self.kline_timeframes():
+                if (sym, tf) not in out:
+                    out.append((sym, tf))
+        return out
+
+    async def warmup_klines(self) -> int:
+        """Seed the kline cache from REST once, then let WS keep it current.
+
+        Returns the number of REST calls spent, so the banner can report it.
+        """
+        if self.s.market_data_source != "ws":
+            return 0
+        calls = 0
+        for sym, tf in self.kline_keys():
+            try:
+                await self._rest_candles(sym, tf, REST_KLINE_MAX)
+                calls += 1
+            except BitunixAPIError as e:
+                self.state.errors.append(f"kline warmup {sym} {tf}: {e}")
+        self.kline_warmup_calls = calls
+        return calls
+
+    def kline_subscription_warnings(self) -> list[str]:
+        """Intervals a strategy needs that the feed is not subscribed to.
+
+        Said at startup instead of silently polling REST forever.
+        """
+        if self.s.market_data_source != "ws" or self.feed is None:
+            return []
+        subscribed = set(self.feed.timeframes)
+        return [f"strategy interval {tf} is NOT subscribed on the WS feed "
+                f"- it will poll REST"
+                for tf in self.kline_timeframes() if tf not in subscribed]
+
+    def kline_cache_report(self) -> str:
+        """Kline cache state for /status and /ws."""
+        c = self.kline_cache
+        st = c.stats
+        lines = [
+            f"kline_cache=keys={len(c.keys())} hits={st.hits} misses={st.misses} "
+            f"stale={st.stale_rejections} short={st.short_series} "
+            f"rest_fallbacks={st.rest_fallbacks} ws_updates={st.ws_updates} "
+            f"replaced={st.replaced} appended={st.appended} "
+            f"rest_kline_calls={self.rest_kline_calls} warmup={self.kline_warmup_calls}"
+        ]
+        for sym, tf in c.keys():
+            age = c.age(sym, tf)
+            lines.append(
+                f"  {sym} {tf}: {c.count(sym, tf)} candles src={c.source(sym, tf)} "
+                f"newest_age={('%.0fs' % age) if age is not None else 'n/a'} "
+                f"max={c.max_age(tf):.0f}s")
+        return "\n".join(lines)
+
     async def get_candles(self, symbol: str, tf: str, limit: int = 300):
-        raw = await self.client.get_kline(symbol, tf, limit=min(limit, 200))
-        return to_candles(raw or [])
+        """THE single candle accessor. Every candle read in the engine goes here.
+
+        ws mode:  a fresh, long-enough, WS-fed series -> return it, zero REST.
+                  stale / short / missing -> REST fallback, counted, warned.
+        rest mode: straight to REST, exactly as before.
+        """
+        sym = (symbol or "").upper()
+        want = min(limit, REST_KLINE_MAX)
+        if self.s.market_data_source == "ws":
+            res = self.kline_cache.try_get(sym, tf, want, min_required=want)
+            if res.usable:
+                return res.candles
+            if res.reason:
+                log.warning("kline cache miss for %s %s: %s - falling back to REST",
+                            sym, tf, res.reason)
+            self.kline_cache.note_rest_fallback()
+        return await self._rest_candles(sym, tf, want)
+
+    async def _rest_candles(self, symbol: str, tf: str, limit: int):
+        self.rest_kline_calls += 1
+        raw = await self.client.get_kline(symbol, tf, limit=limit)
+        candles = to_candles(raw or [])
+        if self.s.market_data_source == "ws" and candles:
+            self.kline_cache.put_rest(symbol, tf, candles)
+        return candles
 
     # ================================================================ scanning
     async def scan_symbol(self, symbol: str) -> Aggregate:

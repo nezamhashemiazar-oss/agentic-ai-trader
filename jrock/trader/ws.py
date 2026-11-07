@@ -51,6 +51,9 @@ from typing import Any, Awaitable, Callable
 
 import websockets
 
+from .indicators import Candle
+from .kline_cache import KlineCache, candle_open_time
+
 log = logging.getLogger("jrock.ws")
 
 Handler = Callable[["Event"], Awaitable[None] | None]
@@ -489,13 +492,15 @@ class MarketDataFeed:
     """One public WS for a set of symbols/timeframes, feeding a PriceCache."""
 
     def __init__(self, cfg: WSConfig, symbols: list[str], timeframes: list[str],
-                 cache: "PriceCache | None" = None):
+                 cache: "PriceCache | None" = None,
+                 kline_cache: KlineCache | None = None):
         from .price_cache import PriceCache
 
         self.ws = BitunixWebSocket(cfg, private=False)
         self.symbols = [s.upper() for s in symbols]
         self.timeframes = list(timeframes)
         self.cache = cache if cache is not None else PriceCache()
+        self.kline_cache = kline_cache
         self.latest_price: dict[str, float] = {}
         self.latest_mark: dict[str, float] = {}
         self.latest_funding: dict[str, float] = {}
@@ -545,15 +550,37 @@ class MarketDataFeed:
                 pass
 
     def _on_kline(self, ev: Event) -> None:
+        """A kline frame carries o/h/l/c/b/q and NO time field.
+
+        Verified live: the push has no `time`, so the candle's open time is
+        derived by flooring the frame `ts` to the interval boundary. Without
+        that, every candle collapses onto one key and the series never grows.
+        """
         sym = ev.symbol
         if not sym:
             return
+        d = ev.data or {}
         for tf in self.timeframes:
             try:
-                if kline_channel(tf) == ev.channel:
-                    self.latest_kline[(sym, tf)] = ev.data or {}
+                if kline_channel(tf) != ev.channel:
+                    continue
             except ValueError:
                 continue
+            self.latest_kline[(sym, tf)] = d
+            if self.kline_cache is None or not ev.ts:
+                return
+            try:
+                candle = Candle(
+                    time=candle_open_time(ev.ts, tf),
+                    open=float(d["o"]), high=float(d["h"]),
+                    low=float(d["l"]), close=float(d["c"]),
+                    base_vol=float(d.get("b") or 0),
+                    quote_vol=float(d.get("q") or 0),
+                )
+            except (KeyError, TypeError, ValueError):
+                return
+            self.kline_cache.put_ws(sym, tf, candle)
+            return
 
     def price(self, symbol: str) -> float | None:
         return self.latest_price.get(symbol.upper())

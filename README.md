@@ -423,6 +423,75 @@ injected stale price 1.0 -> refused (0.5s old, max 0.3s), REST fallback, price 7
 pending asyncio tasks after stop: 0
 ```
 
+### Kline cache - how scans stop polling REST
+
+Prices were only half the story. Every strategy scan still called
+`GET /api/v1/futures/market/kline` for each timeframe. `get_candles()` now goes
+through a `KlineCache` fed by the `market_kline_<interval>` channels.
+
+**The frame has no time field.** Verified live on 2026-11-07, a
+`market_kline_1min` push is:
+
+```json
+{"ch":"market_kline_1min","symbol":"BTCUSDT","ts":1794011946619,
+ "data":{"o":"75915.9","c":"75915.9","h":"75915.9","l":"75915.8","b":"0.0378","q":"2869.62094"}}
+```
+
+`data` has exactly `o/h/l/c/b/q` - there is **no `time`**. The REST kline
+endpoint *does* return `time`. So the candle's open time is derived by flooring
+the frame `ts` to the interval boundary:
+
+```
+open_time = (ts_ms // interval_ms) * interval_ms
+```
+
+Get that wrong and every candle collapses onto one key and the series never
+grows - silently, with no error.
+
+**Replace vs append.** The channel re-pushes the *still-forming* candle every
+500ms. The cache **replaces** the last candle when the open time matches and
+**appends** when a newer open time arrives. Appending blindly would grow the
+series by one every 500ms and corrupt every indicator.
+
+**Staleness is a multiple of the interval, not flat seconds.** A 1m candle is
+legitimately 60s old; a 1d candle is legitimately 24h old. A candle set is
+stale when the newest candle's open time is older than
+`KLINE_MAX_AGE_SEC * interval` (default 2x).
+
+| Situation | What happens |
+|---|---|
+| fresh, long-enough, WS-fed series | returned, `source=ws`, **no REST call** |
+| newest candle older than `KLINE_MAX_AGE_SEC * interval` | **refused**, warning, REST fallback, `stale_rejection` |
+| fewer candles than the caller needs | **refused**, REST fallback, `short_series` - a short series produces a wrong signal, which is worse than a slow one |
+| cache holds REST-seeded candles only | REST fallback (we cannot claim it is live) |
+| WS disconnected | REST fallback; the engine keeps running |
+| `MARKET_DATA_SOURCE=rest` | no cache consulted, **no socket opened at all** |
+
+**Warmup.** The WS only gives candles from the moment you subscribe, so a
+200-candle strategy would need 200 minutes of uptime. On startup the cache is
+seeded from REST **once** per `(symbol, interval)`; the banner reports how many
+calls that cost. The subscribed set is derived from the configured timeframes
+(plus `5m`, which the trailing-stop ATR reads), not a hardcoded list.
+
+Live verification (`scripts/verify_ws_klines.py`, real feed):
+
+```
+market data: ws (connected, 1 symbols)
+kline timeframes subscribed: ['1m', '5m']
+warmup REST calls: 2
+RAW: {"ch": "market_kline_1min", "symbol": "BTCUSDT", "ts": 1794011946619, "data": {...}}
+get_candles('BTCUSDT','1m',200) -> 200 candles, cache src=ws
+closes seen for open=1794011940000: [75915.9, 75915.8, 75915.7, 75915.6]
+same open time (replaced, not appended): True   count stable: True
+open time advanced: True   count grew by exactly one: True (delta=1)
+20 get_candles calls -> REST kline calls: 0
+feed killed + cache cleared -> 200 candles in 212ms, REST kline calls: 1
+frozen cache -> refused (62s old, max 0s), REST fallback
+short series (50 candles, want 200) -> refused, REST fallback
+MARKET_DATA_SOURCE=rest -> WS connect attempts: 0
+pending asyncio tasks after stop: 0
+```
+
 ### Heartbeat detail
 
 The client sends `{"op":"ping","ping":<unix seconds>}` and the server answers

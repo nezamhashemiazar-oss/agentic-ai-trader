@@ -72,6 +72,12 @@ class Settings:
     market_data_source: str = "rest"
     #: A cached WS price older than this is never used for a trading decision.
     price_max_age_sec: float = 5.0
+    #: A candle set is stale when the newest candle's open time is older than
+    #: `kline_max_age_mult * interval`. A 1m candle is legitimately 60s old, so
+    #: the price rule (flat seconds) does not apply to candles.
+    kline_max_age_mult: float = 2.0
+    #: Hard cap on candles held per (symbol, interval). Bounded, never unbounded.
+    kline_cache_max: int = 500
 
     @property
     def data_dir(self) -> Path:
@@ -120,6 +126,8 @@ def load_settings(env_file: str | os.PathLike | None = None) -> Settings:
         thinking_level=level_from_env(),
         market_data_source=_market_data_source(),
         price_max_age_sec=_f("PRICE_MAX_AGE_SEC", 5.0),
+        kline_max_age_mult=_f("KLINE_MAX_AGE_SEC", 2.0),
+        kline_cache_max=_i("KLINE_CACHE_MAX", 500),
     )
 
 

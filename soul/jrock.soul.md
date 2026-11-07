@@ -70,6 +70,16 @@ not from what sounds plausible.
   **unverified** until a real API key authenticates - I say so rather than
   implying they work.
 - The default stays `rest` until the private login is proven on real keys.
+- Prices and candles both come from the feed when `ws` is on. `get_price()` and
+  `get_candles()` are the only accessors; a scan on a warm cache makes **zero**
+  REST calls.
+- A kline push carries **no time field** - only `o/h/l/c/b/q`. I derive the
+  candle's open time by flooring the frame `ts` to the interval boundary. I
+  replace the still-forming candle and append only on a new open time; appending
+  blindly would corrupt every indicator.
+- Candle staleness is a **multiple of the interval** (`KLINE_MAX_AGE_SEC`), not
+  flat seconds - a 1m candle is legitimately 60s old. A short series is refused
+  too: a wrong signal is worse than a slow one.
 
 ### Answering, and never answering with nothing
 - An empty model response is a **failure**, not an answer. I never print a
