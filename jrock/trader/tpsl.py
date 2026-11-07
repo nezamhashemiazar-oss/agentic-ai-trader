@@ -15,9 +15,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .risk import (PairRules, Tier, TpSlSideError, liquidation_price,
-                   min_stop_distance, pick_tier, round_price,
-                   sl_from_liq_distance)
+from .risk import (PairRules, Tier, TpSlSideError, clamp_sl, clamp_tp,
+                   liquidation_price, min_stop_distance, pick_tier,
+                   round_price, sl_from_liq_distance)
 
 R_MULTIPLE = {"none": 1.0, "weak": 1.2, "normal": 1.8, "strong": 2.5, "extreme": 3.2}
 
@@ -79,20 +79,10 @@ def plan_tpsl(*, side: str, entry: float, leverage: int, notional: float,
     # --- clamp the SL to the correct side of BOTH entry and mark.
     # A high-leverage stop can land within a tick of the mark price; rounding
     # then collapses it onto the mark and the exchange rejects the order.
-    if is_long:
-        ceiling = min(entry, ref) - d
-        if sl > ceiling:
-            sl = ceiling
-        # never place the stop at or below liquidation
-        if sl <= liq:
-            sl = liq + d
-    else:
-        floor = max(entry, ref) + d
-        if sl < floor:
-            sl = floor
-        if sl >= liq:
-            sl = liq - d
-    sl = round_price(sl, rules.quote_precision)
+    # clamp_sl is shared with the running-engine path (breakeven/trailing) so
+    # there is exactly one implementation of this rule.
+    sl = clamp_sl(side=side, sl=sl, entry=entry, mark=ref, rules=rules,
+                  min_ticks=min_stop_ticks, liq=liq)
 
     # --- feasibility: the stop must fit BETWEEN the liquidation price and the
     # mark-side limit. At high leverage with a coarse tick there may be no room
@@ -127,15 +117,8 @@ def plan_tpsl(*, side: str, entry: float, leverage: int, notional: float,
     tp = round_price(tp, rules.quote_precision)
 
     # --- clamp the TP to the correct side of BOTH entry and mark.
-    if is_long:
-        tp_floor = max(entry, ref) + d
-        if tp < tp_floor:
-            tp = tp_floor
-    else:
-        tp_ceiling = min(entry, ref) - d
-        if tp > tp_ceiling:
-            tp = tp_ceiling
-    tp = round_price(tp, rules.quote_precision)
+    tp = clamp_tp(side=side, tp=tp, entry=entry, mark=ref, rules=rules,
+                  min_ticks=min_stop_ticks)
 
     def roi(p: float) -> float:
         raw = (p - entry) / entry if side.upper() in ("LONG", "BUY") else (entry - p) / entry

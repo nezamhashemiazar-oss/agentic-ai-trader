@@ -14,6 +14,7 @@ Bitunix futures notes (from the official docs + support article):
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 
 
 @dataclass
@@ -95,7 +96,31 @@ def round_step(value: float, precision: int) -> float:
 
 
 def round_price(price: float, precision: int) -> float:
-    return round(price, max(0, precision))
+    """Round to `precision` decimals, half-up.
+
+    Deliberately NOT Python's built-in `round()`, which is banker's rounding:
+    round(0.0047845, 6) == 0.004784 but round(0.0047855, 6) == 0.004786, so the
+    same distance from the mark can round in either direction. For a price that
+    must stay on one side of the mark that is a coin flip, and it is how a stop
+    that was valid when planned lands on the wrong side when sent.
+    """
+    p = max(0, int(precision))
+    q = Decimal(1).scaleb(-p)
+    return float(Decimal(repr(float(price))).quantize(q, rounding=ROUND_HALF_UP))
+
+
+def floor_price(price: float, precision: int) -> float:
+    """Round DOWN to the tick. Use for anything that must stay BELOW a level."""
+    p = max(0, int(precision))
+    q = Decimal(1).scaleb(-p)
+    return float(Decimal(repr(float(price))).quantize(q, rounding=ROUND_FLOOR))
+
+
+def ceil_price(price: float, precision: int) -> float:
+    """Round UP to the tick. Use for anything that must stay ABOVE a level."""
+    p = max(0, int(precision))
+    q = Decimal(1).scaleb(-p)
+    return float(Decimal(repr(float(price))).quantize(q, rounding=ROUND_CEILING))
 
 
 def format_qty(qty: float, rules: "PairRules") -> str:
@@ -111,11 +136,16 @@ def format_qty(qty: float, rules: "PairRules") -> str:
 
 
 def format_price(price: float, rules: "PairRules") -> str:
-    """Format a price to the symbol's quotePrecision as a string."""
+    """Format a price to the symbol's quotePrecision as a string.
+
+    Uses half-up rounding, matching `round_price`. A price that has already been
+    clamped to the correct side of the mark must not be re-rounded the other way
+    here - that would undo the clamp after it was validated.
+    """
     p = max(0, int(rules.quote_precision))
     if p == 0:
-        return str(int(round(price, 0)))
-    return f"{round(price, p):.{p}f}"
+        return str(int(round_price(price, 0)))
+    return f"{round_price(price, p):.{p}f}"
 
 
 def qty_from_notional(notional_usd: float, price: float, rules: PairRules) -> float:
@@ -234,6 +264,77 @@ def tpsl_bounds(*, side: str, entry: float, mark: float,
     return max(entry, mark) + d, float("inf")
 
 
+def clamp_sl(*, side: str, sl: float, entry: float, mark: float,
+             rules: "PairRules", min_ticks: int = 3,
+             liq: float | None = None) -> float:
+    """Force a stop-loss onto the correct side of BOTH entry and mark.
+
+    This is THE single place a stop-loss price is made safe, and every path that
+    sends an SL must go through it - the entry plan (`plan_tpsl`) and the
+    running-engine updates (breakeven, trailing) alike. The previous fix only
+    covered `plan_tpsl`, so the management path kept sending stops that were
+    never checked against the mark price at all.
+
+    Rounding is direction-aware: a LONG stop is floored and a SHORT stop is
+    ceiled, so rounding can only ever move the stop FURTHER from the mark. Plain
+    nearest-rounding can move it back across the mark by up to half a tick,
+    which is exactly the 30029/30031 rejection.
+    """
+    p = max(0, int(rules.quote_precision))
+    d = min_stop_distance(rules, min_ticks)
+    tick = tick_size(rules)
+    is_long = side.upper() in ("LONG", "BUY")
+
+    # The exchange requires the stop to be STRICTLY beyond the limit, so the
+    # clamp must land strictly beyond it too - a stop that sits exactly on the
+    # limit is still rejected (30023/30029).
+    #
+    # The liquidation guard only applies when `liq` is on the side a real
+    # liquidation would be (below entry for a LONG, above it for a SHORT). A
+    # liq price on the wrong side is stale or belongs to the other direction;
+    # honouring it would push the stop across the mark and cause the very
+    # rejection this function exists to prevent.
+    if is_long:
+        limit = min(entry, mark) - d
+        out = floor_price(min(sl, limit), p)
+        if out >= limit:
+            out = floor_price(limit - tick, p)
+        if liq is not None and 0 < liq < entry and out <= liq:
+            out = ceil_price(liq + d, p)
+        return out
+
+    limit = max(entry, mark) + d
+    out = ceil_price(max(sl, limit), p)
+    if out <= limit:
+        out = ceil_price(limit + tick, p)
+    if liq is not None and liq > entry and out >= liq:
+        out = floor_price(liq - d, p)
+    return out
+
+
+def clamp_tp(*, side: str, tp: float, entry: float, mark: float,
+             rules: "PairRules", min_ticks: int = 3) -> float:
+    """Force a take-profit onto the correct side of BOTH entry and mark.
+
+    Mirror of `clamp_sl`: a LONG TP is ceiled and a SHORT TP is floored, so
+    rounding only ever moves the target further from the mark.
+    """
+    p = max(0, int(rules.quote_precision))
+    d = min_stop_distance(rules, min_ticks)
+    tick = tick_size(rules)
+    if side.upper() in ("LONG", "BUY"):
+        limit = max(entry, mark) + d
+        out = ceil_price(max(tp, limit), p)
+        if out <= limit:
+            out = ceil_price(limit + tick, p)
+        return out
+    limit = min(entry, mark) - d
+    out = floor_price(min(tp, limit), p)
+    if out >= limit:
+        out = floor_price(limit - tick, p)
+    return out
+
+
 def validate_tpsl_side(*, symbol: str, side: str, entry: float, mark: float,
                        sl: float | None, tp: float | None,
                        rules: "PairRules", min_ticks: int = 3,
@@ -249,6 +350,14 @@ def validate_tpsl_side(*, symbol: str, side: str, entry: float, mark: float,
     is_long = side.upper() in ("LONG", "BUY")
     d = min_stop_distance(rules, min_ticks)
     out: list[str] = []
+
+    # A non-positive price means "not set" (PositionState defaults sl/tp to 0.0
+    # for a position the engine did not open itself). Treating 0.0 as a real
+    # price would flag every such position as a violation.
+    if sl is not None and sl <= 0:
+        sl = None
+    if tp is not None and tp <= 0:
+        tp = None
 
     if sl is not None:
         if is_long:

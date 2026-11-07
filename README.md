@@ -559,9 +559,10 @@ python scripts/verify_restart.py   # the same through the real agent command pat
 python -m pytest -q tests
 ```
 
-391 tests covering indicators, risk math, all 16 strategies (including empty and
+425 tests covering indicators, risk math, all 16 strategies (including empty and
 short-data inputs), aggregation rules, TP/SL planning and side validation
-(30020-30033), the order-size pre-flight (20003, tier leverage caps, margin
+(30020-30033), the **running-engine** TP/SL path (breakeven + trailing, the
+second 30029), the order-size pre-flight (20003, tier leverage caps, margin
 bounds), API-reference/client drift, model probing, request signing, CLI
 routing, the thinking-level system (levels, aliases, persistence, and the exact
 request parameter sent), the balance command, empty-model-response diagnosis,
@@ -579,19 +580,50 @@ have refused locally.
 
 ### 30029 `SL price must be less than mark price`
 
-The engine computed the stop-loss from the **entry (last) price** and never
-fetched the **mark price**. Bitunix validates the trigger against the mark
-price, so when the mark sat below the last price the stop landed on the wrong
-side and the whole order was rejected.
+This one had **two** independent causes. The first fix (58f901c) only closed
+the first, which is why the error came back on a live AKEUSDT order.
+
+**Cause 1 - the entry plan ignored the mark price.** The engine computed the
+stop-loss from the **entry (last) price** and never fetched the **mark price**.
+Bitunix validates the trigger against the mark price, so when the mark sat
+below the last price the stop landed on the wrong side and the whole order was
+rejected.
+
+**Cause 2 - the running-engine path was never fixed at all.** `plan_tpsl` was
+made mark-aware, but the management loop (`manage_positions`: breakeven and
+trailing) built its own stop-loss with a hardcoded `round_price(..., 4)` and
+never fetched the mark price. On AKEUSDT (`quotePrecision: 6`, price ~0.005)
+rounding to 4 decimals turns `0.005051` into `0.005100` - above the mark - and
+the exchange answers:
+
+```
+[30029] SL price must be less than mark price: 0.0051
+```
+
+The `0.0051` in that message is the fingerprint: **four decimals on a symbol
+that trades in six.**
 
 The fix:
 
-- `get_mark_price()` fetches the real mark price; `try_enter` passes it into
-  `plan_tpsl` and `build_order_body`.
-- `plan_tpsl` clamps the SL/TP to clear **both** the entry and the mark price
-  by at least `TP_SL_MIN_STOP_TICKS` ticks (default 3).
+- `risk.clamp_sl()` / `risk.clamp_tp()` are now the **single** place a TP/SL is
+  made safe, and every path that sends one goes through them - the entry plan
+  *and* the management loop. Rounding is direction-aware (a LONG stop is
+  floored, a SHORT stop is ceiled) so rounding can only move a stop *further*
+  from the mark, never back across it.
+- `round_price()` is half-up, not Python's banker's rounding, which rounds the
+  same distance in either direction.
+- `manage_positions` fetches the mark price **fresh** for every position and
+  re-clamps before sending; `try_enter` re-reads the mark immediately before
+  the request and re-clamps, closing the window in which the mark can move
+  during the pre-flight round-trips.
+- `format_price()` no longer re-rounds with `round()`, which could undo a clamp
+  after it had been validated.
+- When the mark price cannot be fetched, the fallback is the last price widened
+  by the symbol's price-protection scope in the safe direction - not the raw
+  last price, which can sit on the wrong side of the mark.
 - `validate_tpsl_side()` covers the documented rules 30020-30033 and
-  30024/30025 (liquidation side) for both directions.
+  30024/30025 (liquidation side) for both directions, and is re-run on the
+  exact values about to be sent.
 - `build_order_body` refuses locally with the symbol, direction, SL price,
   mark price and the rule violated.
 - If no valid stop exists (high leverage + coarse tick), `TpSlSideError` names

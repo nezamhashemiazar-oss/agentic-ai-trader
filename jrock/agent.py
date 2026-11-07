@@ -1435,10 +1435,11 @@ class JRockAgent:
             (r"30024|30025|liq price", "SL is on the wrong side of the liquidation price: "
                                        "recompute with sl_from_liq_distance()."),
             (r"30029|30031|SL price must be (less|greater) than mark",
-             "SL is on the wrong side of the MARK price. The engine now fetches the "
-             "mark price and clamps the stop to clear it by TP_SL_MIN_STOP_TICKS "
-             "ticks; if you see this, the mark moved between planning and sending - "
-             "retry, or raise TP_SL_MIN_STOP_TICKS."),
+             "SL is on the wrong side of the MARK price. Every TP/SL path now "
+             "fetches the mark price fresh and clamps the stop through "
+             "risk.clamp_sl() to clear it by TP_SL_MIN_STOP_TICKS ticks. If you "
+             "still see this, the mark moved between the last read and the "
+             "request landing - retry, or raise TP_SL_MIN_STOP_TICKS."),
             (r"30020|30021|30027|30033|TP price must be",
              "TP is on the wrong side of the mark price: widen the TP distance."),
             (r"30005|trigger price", "TP/SL trigger too close to price: widen the distance."),

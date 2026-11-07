@@ -27,9 +27,10 @@ from .kline_cache import REST_KLINE_MAX, KlineCache
 from .order_builder import (OrderValidationError, build_order_body,
                             debug_order_enabled, log_order_body)
 from .price_cache import PriceCache
-from .risk import (PairRules, Tier, TpSlSideError, margin_required,
-                   pick_tier, position_size_by_risk, qty_from_notional,
-                   roi_pct, round_price, round_step)
+from .risk import (PairRules, Tier, TpSlSideError, clamp_sl, clamp_tp,
+                   format_price, margin_required, pick_tier,
+                   position_size_by_risk, qty_from_notional, roi_pct,
+                   round_price, round_step, validate_tpsl_side)
 from .strategies import build_strategies
 from .tpsl import (PositionState, mid_management_action, next_trailing_stop,
                    plan_tpsl, should_breakeven, should_trail)
@@ -371,6 +372,22 @@ class TraderEngine:
                     continue
         return 0.0
 
+    @staticmethod
+    def _conservative_mark(last: float, side: str, rules: PairRules) -> float:
+        """A mark-price stand-in that is safe for BOTH directions.
+
+        Used only when the real mark price cannot be fetched. The last price can
+        be on either side of the mark, so we widen it by the symbol's
+        price-protection scope and pick the end that makes the stop harder to
+        place: for a LONG the reference is pushed DOWN (the stop must clear a
+        lower mark), for a SHORT it is pushed UP. A stop that clears this
+        reference clears any mark inside the protection band.
+        """
+        scope = rules.price_protect_scope if rules.price_protect_scope > 0 else 0.02
+        if side.upper() in ("LONG", "BUY"):
+            return last * (1 - scope)
+        return last * (1 + scope)
+
     def persist_positions(self) -> None:
         """Mirror the in-memory position-management state to the store.
 
@@ -631,12 +648,17 @@ class TraderEngine:
 
         # The exchange validates TP/SL against the MARK price, not the last
         # price. Fetch it so the plan is built on the same reference the
-        # exchange will use; fall back to the last price if it is unavailable.
+        # exchange will use. If it is unavailable we do NOT silently fall back
+        # to the last price: the last price can sit on the wrong side of the
+        # mark, which is exactly how a stop passes locally and is rejected with
+        # 30029. Instead the fallback is widened by the price-protection scope
+        # so the stop clears a mark that could be anywhere inside that band.
         mark = await self.get_mark_price(sym)
         if mark <= 0:
-            mark = price
-            log.warning("no mark price for %s - validating TP/SL against the "
-                        "last price %s", sym, price)
+            mark = self._conservative_mark(price, side, rules)
+            log.warning("no mark price for %s - using a conservative reference "
+                        "%s (last price %s widened by the protection scope)",
+                        sym, mark, price)
 
         # account equity
         try:
@@ -753,6 +775,27 @@ class TraderEngine:
                 self.state.errors.append(f"leverage {sym}: {e}")
 
         order_side = "BUY" if side == "LONG" else "SELL"
+
+        # --- re-read the mark price immediately before sending and re-clamp.
+        # The plan above was built from a mark read several round-trips ago
+        # (account, tiers, margin mode, leverage). On a fast-moving symbol the
+        # mark can cross the stop in that window, and the exchange validates
+        # against the mark at the moment the request lands - not the one we
+        # planned with. Re-clamping here is what makes the stop safe on the
+        # wire rather than only at planning time.
+        mark_now = await self.get_mark_price(sym)
+        if mark_now > 0:
+            mark = mark_now
+        plan.sl = clamp_sl(side=side, sl=plan.sl, entry=price, mark=mark,
+                           rules=rules, min_ticks=self.s.tpsl_min_stop_ticks,
+                           liq=plan.liq)
+        plan.tp = clamp_tp(side=side, tp=plan.tp, entry=price, mark=mark,
+                           rules=rules, min_ticks=self.s.tpsl_min_stop_ticks)
+        if not self._tpsl_side_ok(sym, side, price, mark, plan.sl, plan.tp, rules):
+            return {"ok": False,
+                    "reason": "TP/SL would be rejected by the exchange after the "
+                              "mark price moved; order not sent"}
+
         try:
             body = build_order_body(
                 symbol=sym, qty=qty, side=order_side, tradeSide="OPEN",
@@ -831,6 +874,26 @@ class TraderEngine:
                 self.state.errors.append(f"manage_loop: {type(e).__name__}: {e}")
             await asyncio.sleep(max(5, self.state.scan_interval))
 
+    def _tpsl_side_ok(self, sym: str, side: str, entry: float, mark: float,
+                      sl: float | None, tp: float | None,
+                      rules: PairRules) -> bool:
+        """Last gate before a managed TP/SL is sent.
+
+        `clamp_sl`/`clamp_tp` already put the prices on the correct side; this
+        re-checks the exact values that will go on the wire and refuses to send
+        a request the exchange would reject with 30020-30033. A refusal is
+        recorded as an error so it is visible in /status instead of silently
+        dropping the update.
+        """
+        violations = validate_tpsl_side(
+            symbol=sym, side=side, entry=entry, mark=mark, sl=sl, tp=tp,
+            rules=rules, min_ticks=self.s.tpsl_min_stop_ticks)
+        if violations:
+            self.state.errors.append(
+                "manage TP/SL refused locally: " + "; ".join(violations))
+            return False
+        return True
+
     async def manage_positions(self) -> list[dict]:
         actions: list[dict] = []
         positions = await self.open_positions()
@@ -864,19 +927,43 @@ class TraderEngine:
                 self.positions[pid] = st
             st.peak_roi = max(st.peak_roi, roi)
 
+            # The exchange validates every TP/SL trigger against the MARK price
+            # at the moment the request lands, so the mark must be read fresh
+            # here - not reused from entry time, and never assumed to equal the
+            # last price. Without this the management path sent stops that were
+            # only ever checked against the entry price (30029/30031).
+            mark = await self.get_mark_price(sym)
+            if mark <= 0:
+                mark = price
+                log.warning("no mark price for %s - validating the managed "
+                            "TP/SL against the last price %s", sym, price)
+            rules = self.rules.get(sym)
+            if rules is None:
+                await self.load_rules([sym])
+                rules = self.rules.get(sym)
+            if rules is None:
+                self.state.errors.append(
+                    f"manage {sym}: no trading rules, skipping TP/SL update")
+                continue
+
             # 1) breakeven
             if should_breakeven(st, roi, self.state.breakeven_pct):
-                try:
-                    await self.client.modify_position_tp_sl_order(
-                        sym, pid, tp_price=str(st.tp) if st.tp else None,
-                        sl_price=str(round_price(entry, 4)))
-                    st.breakeven_done = True
-                    st.sl = entry
-                    actions.append({"action": "breakeven", "symbol": sym, "roi": round(roi, 2)})
-                    self._log_tpsl({"event": "breakeven", "ts": time.time(), "symbol": sym,
-                                    "position_id": pid, "sl": entry, "roi": round(roi, 2)})
-                except BitunixAPIError as e:
-                    self.state.errors.append(f"breakeven {sym}: {e}")
+                sl = clamp_sl(side=side, sl=entry, entry=entry, mark=mark,
+                              rules=rules, min_ticks=self.s.tpsl_min_stop_ticks,
+                              liq=st.liq or None)
+                if self._tpsl_side_ok(sym, side, entry, mark, sl, st.tp, rules):
+                    try:
+                        await self.client.modify_position_tp_sl_order(
+                            sym, pid, tp_price=format_price(st.tp, rules) if st.tp else None,
+                            sl_price=format_price(sl, rules))
+                        st.breakeven_done = True
+                        st.sl = sl
+                        actions.append({"action": "breakeven", "symbol": sym,
+                                        "sl": sl, "roi": round(roi, 2)})
+                        self._log_tpsl({"event": "breakeven", "ts": time.time(), "symbol": sym,
+                                        "position_id": pid, "sl": sl, "roi": round(roi, 2)})
+                    except BitunixAPIError as e:
+                        self.state.errors.append(f"breakeven {sym}: {e}")
 
             # 2) trailing
             if should_trail(st, roi, self.state.trailing_trigger_roi_pct):
@@ -888,20 +975,24 @@ class TraderEngine:
                     atr_val = price * 0.002
                 new_stop = next_trailing_stop(st, price, atr_val)
                 if new_stop is not None:
-                    try:
-                        await self.client.modify_position_tp_sl_order(
-                            sym, pid, tp_price=str(st.tp) if st.tp else None,
-                            sl_price=str(round_price(new_stop, 4)))
-                        st.trailing_stop = new_stop
-                        st.trailing_active = True
-                        st.sl = new_stop
-                        actions.append({"action": "trail", "symbol": sym,
-                                        "new_sl": round(new_stop, 6), "roi": round(roi, 2)})
-                        self._log_tpsl({"event": "trail", "ts": time.time(), "symbol": sym,
-                                        "position_id": pid, "sl": new_stop,
-                                        "roi": round(roi, 2)})
-                    except BitunixAPIError as e:
-                        self.state.errors.append(f"trail {sym}: {e}")
+                    sl = clamp_sl(side=side, sl=new_stop, entry=entry, mark=mark,
+                                  rules=rules, min_ticks=self.s.tpsl_min_stop_ticks,
+                                  liq=st.liq or None)
+                    if self._tpsl_side_ok(sym, side, entry, mark, sl, st.tp, rules):
+                        try:
+                            await self.client.modify_position_tp_sl_order(
+                                sym, pid, tp_price=format_price(st.tp, rules) if st.tp else None,
+                                sl_price=format_price(sl, rules))
+                            st.trailing_stop = sl
+                            st.trailing_active = True
+                            st.sl = sl
+                            actions.append({"action": "trail", "symbol": sym,
+                                            "new_sl": sl, "roi": round(roi, 2)})
+                            self._log_tpsl({"event": "trail", "ts": time.time(), "symbol": sym,
+                                            "position_id": pid, "sl": sl,
+                                            "roi": round(roi, 2)})
+                        except BitunixAPIError as e:
+                            self.state.errors.append(f"trail {sym}: {e}")
 
             # 3) mid-management
             agg = self.last_aggregates.get(sym)
