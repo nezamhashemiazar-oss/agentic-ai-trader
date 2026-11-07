@@ -284,6 +284,8 @@ class JRockAgent:
             f"thinking={self.thinking_level}",
             f"market_data={self.s.market_data_source}",
             f"market_data_state={self.engine.market_data_report()}",
+            f"tp_sl_trigger={self.s.tp_sl_trigger_type}",
+            f"order_unit={self.s.order_unit}",
             f"price_cache={self._cache_line()}",
             f"kline_cache={self._kline_cache_line()}",
             f"memory={self.memory.stats()['total']} entries "

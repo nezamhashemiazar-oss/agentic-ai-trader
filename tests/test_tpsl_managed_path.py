@@ -179,9 +179,12 @@ class FakeClient:
     async def get_trading_pairs(self, symbols=None):
         return [PAIR_ROW]
 
-    async def modify_position_tp_sl_order(self, sym, pid, tp_price=None, sl_price=None):
+    async def modify_position_tp_sl_order(self, sym, pid, tp_price=None, sl_price=None,
+                                          tp_stop_type=None, sl_stop_type=None):
         self.modified.append({"symbol": sym, "positionId": pid,
-                              "tpPrice": tp_price, "slPrice": sl_price})
+                              "tpPrice": tp_price, "slPrice": sl_price,
+                              "tpStopType": tp_stop_type,
+                              "slStopType": sl_stop_type})
         return {"orderId": "T1"}
 
     async def get_kline(self, *a, **k):

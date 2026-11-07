@@ -382,12 +382,21 @@ class BitunixClient:
 
     async def modify_position_tp_sl_order(self, symbol: str, position_id: str,
                                           tp_price: str | None = None,
-                                          sl_price: str | None = None) -> Any:
+                                          sl_price: str | None = None,
+                                          tp_stop_type: str | None = None,
+                                          sl_stop_type: str | None = None) -> Any:
         body: dict[str, Any] = {"symbol": symbol, "positionId": position_id}
         if tp_price:
             body["tpPrice"] = str(tp_price)
         if sl_price:
             body["slPrice"] = str(sl_price)
+        # Documented optional fields (LAST_PRICE | MARK_PRICE). Omitting them
+        # makes the exchange fall back to its own default, which may not be the
+        # price the local pre-flight validated against.
+        if tp_stop_type:
+            body["tpStopType"] = str(tp_stop_type).upper()
+        if sl_stop_type:
+            body["slStopType"] = str(sl_stop_type).upper()
         return await self.request("POST", "/api/v1/futures/tpsl/position/modify_order", body=body)
 
     async def cancel_tp_sl_order(self, order_id: str) -> Any:

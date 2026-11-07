@@ -649,8 +649,62 @@ Configurable bounds (all default `0` = disabled, so behaviour is unchanged):
 | `MAX_MARGIN_USDT` | refuse orders whose margin is above this |
 | `MAX_NOTIONAL_USDT` | refuse orders whose notional is above this |
 | `TP_SL_MIN_STOP_TICKS` | minimum stop distance from mark/entry, in ticks |
+| `TP_SL_TRIGGER_TYPE` | `MARK_PRICE` (default) or `LAST_PRICE` |
+| `ORDER_UNIT` | `QUANTITY` (default), `NOTIONAL` or `COST` |
 
 Verify against live data: `python scripts/verify_tpsl_side.py`
+
+---
+
+## The 4 TP/SL variants and the 3 order units
+
+### The 4 TP/SL variants
+
+`place_order` takes two independent enums for each of TP and SL, giving four
+documented combinations:
+
+| Field | Values | Defined at |
+|---|---|---|
+| `tpOrderType` / `slOrderType` | `LIMIT`, `MARKET` | `order_builder.py:39` `ORDER_PRICE_TYPES` |
+| `tpStopType` / `slStopType` | `MARK_PRICE`, `LAST_PRICE` | `order_builder.py:40` `STOP_TYPES` |
+
+| # | `tpOrderType`/`slOrderType` | `tpStopType`/`slStopType` |
+|---|---|---|
+| 1 | `LIMIT` | `MARK_PRICE` |
+| 2 | `LIMIT` | `LAST_PRICE` |
+| 3 | `MARKET` | `MARK_PRICE` |
+| 4 | `MARKET` | `LAST_PRICE` |
+
+All four are validated in `build_order_body` (`order_builder.py:152-157`) and
+placed into the body by `OrderSpec.to_body` (`order_builder.py:79-81`). The
+engine's own entry path uses variant 3 (`MARKET`/`MARK_PRICE`) at
+`engine.py:826-828`.
+
+### The 3 order units
+
+Per the official help article *"Explanation of the Order Units in Futures
+Trading"*, Bitunix offers three units. All three are implemented in
+`risk.py:171` `ORDER_UNITS` and converted by `qty_from_unit` (`risk.py:174`):
+
+| Unit | Meaning | Conversion |
+|---|---|---|
+| `QUANTITY` | base-coin quantity | `qty = amount` |
+| `NOTIONAL` | position value in USDT | `qty = amount / price` |
+| `COST` | margin paid in USDT | `qty = amount * leverage / price` |
+
+The wire format is **always** base-coin `qty` — the unit only changes how the
+size is specified. `ORDER_UNIT` selects it; `QUANTITY` is the default and a
+no-op, so historical behaviour is unchanged.
+
+### Which price the trigger is compared against
+
+`TP_SL_TRIGGER_TYPE` selects it, read in exactly one place —
+`engine.py:375` `get_trigger_price()`. Both the local pre-flight validation and
+the `tpStopType`/`slStopType` sent on the wire read that same setting, so they
+cannot drift apart. Default `MARK_PRICE` (the documented Bitunix default and
+the engine's historical behaviour).
+
+Verify: `python scripts/verify_tpsl_variants.py`
 
 ---
 

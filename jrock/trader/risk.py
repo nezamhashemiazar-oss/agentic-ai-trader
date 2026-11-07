@@ -163,6 +163,55 @@ def margin_required(notional: float, leverage: int) -> float:
     return notional / max(1, leverage)
 
 
+#: The three order units Bitunix documents in
+#: "Explanation of the Order Units in Futures Trading":
+#:   QUANTITY - base-coin quantity (the `qty` field of place_order)
+#:   NOTIONAL - position value in USDT
+#:   COST     - margin paid in USDT (initial margin, before fees)
+ORDER_UNITS = ("QUANTITY", "NOTIONAL", "COST")
+
+
+def qty_from_unit(amount: float, unit: str, price: float, leverage: int,
+                  rules: PairRules) -> float:
+    """Convert an order size expressed in one of the three documented units
+    into the base-coin quantity that place_order's `qty` field requires.
+
+        QUANTITY  qty = amount
+        NOTIONAL  qty = amount / price
+        COST      qty = amount * leverage / price
+
+    The wire format is always base-coin qty; the unit only changes how the
+    caller specifies the size. An unknown unit raises rather than guessing.
+    """
+    u = (unit or "QUANTITY").strip().upper()
+    if u not in ORDER_UNITS:
+        raise ValueError(
+            f"unknown order unit {unit!r}. Allowed: {', '.join(ORDER_UNITS)}.")
+    if price <= 0:
+        return 0.0
+    if u == "QUANTITY":
+        raw = amount
+    elif u == "NOTIONAL":
+        raw = amount / price
+    else:  # COST
+        raw = amount * max(1, leverage) / price
+    return round_step(raw, rules.base_precision)
+
+
+def unit_from_qty(qty: float, unit: str, price: float, leverage: int) -> float:
+    """Inverse of qty_from_unit: express a base-coin qty in the given unit."""
+    u = (unit or "QUANTITY").strip().upper()
+    if u not in ORDER_UNITS:
+        raise ValueError(
+            f"unknown order unit {unit!r}. Allowed: {', '.join(ORDER_UNITS)}.")
+    notional = qty * price
+    if u == "QUANTITY":
+        return qty
+    if u == "NOTIONAL":
+        return notional
+    return margin_required(notional, leverage)
+
+
 def pick_tier(tiers: list[Tier], notional: float) -> Tier:
     """Tier whose [startValue, endValue) contains the notional."""
     if not tiers:

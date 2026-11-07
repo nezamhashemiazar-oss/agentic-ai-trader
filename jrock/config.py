@@ -82,12 +82,33 @@ class Settings:
     #: (1 tick = 10^-quotePrecision). Prevents rounding from collapsing a stop
     #: onto the mark price, which the exchange rejects with 30029/30031.
     tpsl_min_stop_ticks: int = 3
+    #: Which price the exchange compares a TP/SL trigger against.
+    #:   MARK_PRICE - the exchange mark price (Bitunix default, and what the
+    #:                engine has always sent)
+    #:   LAST_PRICE - the last traded price
+    #: This value is used for BOTH the local pre-flight validation and the
+    #: tpStopType/slStopType actually sent in the order body. A mismatch between
+    #: the two is exactly what produced 30029: the stop was checked against the
+    #: last price and rejected against the mark price.
+    tp_sl_trigger_type: str = "MARK_PRICE"
+    #: Which unit the engine sizes an order in, per the official Bitunix help
+    #: article "Explanation of the Order Units in Futures Trading":
+    #:   QUANTITY - base-coin quantity (what place_order's `qty` field takes;
+    #:              the engine's historical behaviour)
+    #:   NOTIONAL - position value in USDT; qty = notional / price
+    #:   COST     - margin paid in USDT; qty = cost * leverage / price
+    #: The wire format is always `qty` (base coin) - the unit only changes how
+    #: the size is specified and converted.
+    order_unit: str = "QUANTITY"
     #: Order-size bounds, in USDT. 0 disables the bound. These are the engine's
     #: OWN limits, checked before the request is sent; the exchange has its own
     #: (minTradeVolume / maxMarketOrderVolume) which are enforced separately.
     min_margin_usdt: float = 0.0
     max_margin_usdt: float = 0.0
     max_notional_usdt: float = 0.0
+    #: Hard cap on learned-memory entries. The store evicts by weight once the
+    #: cap is reached, so the file cannot grow without bound.
+    max_memory_items: int = 5000
 
     @property
     def data_dir(self) -> Path:
@@ -139,11 +160,33 @@ def load_settings(env_file: str | os.PathLike | None = None) -> Settings:
         kline_max_age_mult=_f("KLINE_MAX_AGE_SEC", 2.0),
         kline_cache_max=_i("KLINE_CACHE_MAX", 500),
         tpsl_min_stop_ticks=_i("TP_SL_MIN_STOP_TICKS", 3),
+        tp_sl_trigger_type=_tp_sl_trigger_type(),
+        order_unit=_order_unit(),
         min_margin_usdt=_f("MIN_MARGIN_USDT", 0.0),
         max_margin_usdt=_f("MAX_MARGIN_USDT", 0.0),
         max_notional_usdt=_f("MAX_NOTIONAL_USDT", 0.0),
         max_memory_items=_i("MAX_MEMORY_ITEMS", 5000),
     )
+
+
+def _tp_sl_trigger_type() -> str:
+    """TP_SL_TRIGGER_TYPE=MARK_PRICE|LAST_PRICE, default MARK_PRICE.
+
+    MARK_PRICE is the documented Bitunix default and the engine's historical
+    behaviour, so an unset or unrecognised value keeps it.
+    """
+    v = (os.getenv("TP_SL_TRIGGER_TYPE") or "MARK_PRICE").strip().upper()
+    return v if v in ("MARK_PRICE", "LAST_PRICE") else "MARK_PRICE"
+
+
+def _order_unit() -> str:
+    """ORDER_UNIT=QUANTITY|NOTIONAL|COST, default QUANTITY.
+
+    QUANTITY is what place_order's `qty` field takes and what the engine has
+    always used, so an unset or unrecognised value keeps it.
+    """
+    v = (os.getenv("ORDER_UNIT") or "QUANTITY").strip().upper()
+    return v if v in ("QUANTITY", "NOTIONAL", "COST") else "QUANTITY"
 
 
 def _market_data_source() -> str:

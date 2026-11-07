@@ -29,8 +29,9 @@ from .order_builder import (OrderValidationError, build_order_body,
 from .price_cache import PriceCache
 from .risk import (PairRules, Tier, TpSlSideError, clamp_sl, clamp_tp,
                    format_price, margin_required, pick_tier,
-                   position_size_by_risk, qty_from_notional, roi_pct,
-                   round_price, round_step, validate_tpsl_side)
+                   position_size_by_risk, qty_from_notional, qty_from_unit,
+                   roi_pct, round_price, round_step, unit_from_qty,
+                   validate_tpsl_side)
 from .strategies import build_strategies
 from .tpsl import (PositionState, mid_management_action, next_trailing_stop,
                    plan_tpsl, should_breakeven, should_trail)
@@ -371,6 +372,24 @@ class TraderEngine:
                 except (TypeError, ValueError):
                     continue
         return 0.0
+
+    async def get_trigger_price(self, symbol: str, last: float = 0.0) -> float:
+        """The price the exchange compares a TP/SL trigger against.
+
+        Controlled by TP_SL_TRIGGER_TYPE:
+            MARK_PRICE (default) - the exchange mark price
+            LAST_PRICE           - the last traded price
+
+        This is the SINGLE place the choice is made. Both the local pre-flight
+        validation and the tpStopType/slStopType sent in the order body read
+        this same setting, so they can never disagree - a disagreement is
+        exactly what produced 30029 (checked against last, rejected against
+        mark).
+        """
+        if (self.s.tp_sl_trigger_type or "MARK_PRICE").upper() == "LAST_PRICE":
+            px = last if last > 0 else await self.get_price(symbol)
+            return px
+        return await self.get_mark_price(symbol)
 
     @staticmethod
     def _conservative_mark(last: float, side: str, rules: PairRules) -> float:
@@ -714,6 +733,20 @@ class TraderEngine:
         if qty <= 0:
             return {"ok": False, "reason": "computed qty is 0 (risk too small or below min volume)"}
 
+        # ORDER_UNIT only changes how the size is EXPRESSED; the wire format is
+        # always base-coin qty. QUANTITY (the default) is a no-op, so the
+        # historical behaviour is unchanged. NOTIONAL/COST re-derive qty from
+        # the risk-sized notional/margin so the two can never disagree.
+        order_unit = (self.s.order_unit or "QUANTITY").upper()
+        if order_unit != "QUANTITY":
+            sized_notional = qty * price
+            amount = unit_from_qty(qty, order_unit, price, self.state.leverage)
+            qty = qty_from_unit(amount, order_unit, price, self.state.leverage, rules)
+            if qty <= 0:
+                return {"ok": False,
+                        "reason": f"computed qty is 0 in {order_unit} units "
+                                  f"(amount={amount}, notional={sized_notional})"}
+
         # --- pre-flight: the required margin must fit the real available
         # balance, and the engine's own bounds. Without this the request is
         # sent and the exchange answers 20003 Insufficient balance.
@@ -776,6 +809,11 @@ class TraderEngine:
 
         order_side = "BUY" if side == "LONG" else "SELL"
 
+        # The trigger type is read ONCE and used for both the local validation
+        # below and the tpStopType/slStopType sent on the wire. Reading it twice
+        # is how the two can drift apart.
+        trigger_type = (self.s.tp_sl_trigger_type or "MARK_PRICE").upper()
+
         # --- re-read the mark price immediately before sending and re-clamp.
         # The plan above was built from a mark read several round-trips ago
         # (account, tiers, margin mode, leverage). On a fast-moving symbol the
@@ -783,7 +821,7 @@ class TraderEngine:
         # against the mark at the moment the request lands - not the one we
         # planned with. Re-clamping here is what makes the stop safe on the
         # wire rather than only at planning time.
-        mark_now = await self.get_mark_price(sym)
+        mark_now = await self.get_trigger_price(sym, last=price)
         if mark_now > 0:
             mark = mark_now
         plan.sl = clamp_sl(side=side, sl=plan.sl, entry=price, mark=mark,
@@ -800,8 +838,8 @@ class TraderEngine:
             body = build_order_body(
                 symbol=sym, qty=qty, side=order_side, tradeSide="OPEN",
                 orderType="MARKET", reduceOnly=False,
-                tpPrice=plan.tp, tpStopType="MARK_PRICE", tpOrderType="MARKET",
-                slPrice=plan.sl, slStopType="MARK_PRICE", slOrderType="MARKET",
+                tpPrice=plan.tp, tpStopType=trigger_type, tpOrderType="MARKET",
+                slPrice=plan.sl, slStopType=trigger_type, slOrderType="MARKET",
                 rules=rules, known_symbols=set(self.rules) or None,
                 mark_price=mark, entry_price=price,
                 min_stop_ticks=self.s.tpsl_min_stop_ticks,
@@ -932,11 +970,12 @@ class TraderEngine:
             # here - not reused from entry time, and never assumed to equal the
             # last price. Without this the management path sent stops that were
             # only ever checked against the entry price (30029/30031).
-            mark = await self.get_mark_price(sym)
+            mark = await self.get_trigger_price(sym, last=price)
             if mark <= 0:
                 mark = price
-                log.warning("no mark price for %s - validating the managed "
+                log.warning("no trigger price for %s - validating the managed "
                             "TP/SL against the last price %s", sym, price)
+            trigger_type = (self.s.tp_sl_trigger_type or "MARK_PRICE").upper()
             rules = self.rules.get(sym)
             if rules is None:
                 await self.load_rules([sym])
@@ -955,7 +994,8 @@ class TraderEngine:
                     try:
                         await self.client.modify_position_tp_sl_order(
                             sym, pid, tp_price=format_price(st.tp, rules) if st.tp else None,
-                            sl_price=format_price(sl, rules))
+                            sl_price=format_price(sl, rules),
+                            tp_stop_type=trigger_type, sl_stop_type=trigger_type)
                         st.breakeven_done = True
                         st.sl = sl
                         actions.append({"action": "breakeven", "symbol": sym,
@@ -982,7 +1022,8 @@ class TraderEngine:
                         try:
                             await self.client.modify_position_tp_sl_order(
                                 sym, pid, tp_price=format_price(st.tp, rules) if st.tp else None,
-                                sl_price=format_price(sl, rules))
+                                sl_price=format_price(sl, rules),
+                                tp_stop_type=trigger_type, sl_stop_type=trigger_type)
                             st.trailing_stop = sl
                             st.trailing_active = True
                             st.sl = sl
