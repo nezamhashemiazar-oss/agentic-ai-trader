@@ -684,6 +684,77 @@ Verify: `python scripts/verify_four_tpsl_and_docs.py`
 
 ---
 
+## The API contract — the root-cause fix
+
+The defects above were not random. The engine was built from **partial knowledge
+of the docs** rather than a full read of the official API reference, and that is
+the root cause of every one of them: the 30029 SL-side error, the 404 paths, the
+wrong parameter names, the missing endpoints. Fixing them one at a time does not
+stop the next one.
+
+So the docs are now read by a script, and the code is checked against them.
+
+### `docs/bitunix_api_contract.json`
+
+Fetched from the official reference by `scripts/fetch_api_contract.py`, which
+enumerates every page in the API nav, fetches each one, and extracts the
+machine-readable contract: HTTP method, exact path, every request parameter with
+its name/type/required flag, and the documented response fields — each entry
+carrying its `source_url` and `fetched_at`.
+
+**54 pages: 39 REST endpoints, 10 WebSocket channels, 5 guides.**
+A human-readable mirror is at `docs/bitunix_api_contract.md`.
+
+```bash
+python scripts/fetch_api_contract.py            # re-fetch from the live docs
+python scripts/fetch_api_contract.py --offline  # rebuild from docs/_raw_api_docs/
+```
+
+### `scripts/audit_api_contract.py`
+
+Parses `jrock/trader/client.py` with the AST (no network, no credentials) and
+compares every `request(...)` call against the contract. Per endpoint it reports
+implemented / missing, and for implemented ones every missing required param,
+wrong param name and undocumented extra.
+
+```bash
+python scripts/audit_api_contract.py            # human report
+python scripts/audit_api_contract.py --strict   # exit 1 on any finding
+```
+
+**It is wired into the test suite** (`tests/test_api_contract.py`), so a
+mismatch fails the build. That is the guard that stops this class of bug coming
+back — and there is a test that deliberately breaks a parameter name and asserts
+the checker fails, so the guard itself cannot rot.
+
+### What the full audit found
+
+| # | Endpoint | Defect | Fix |
+|---|---|---|---|
+| 1 | `GET /account/get_leverage_margin_mode` | engine called `/account/leverage_margin_mode` — not a documented path | path corrected |
+| 2 | `GET /account/position_mode` | **not implemented at all** | added |
+| 3 | `GET /account/trading_settings` | **not implemented at all** | added |
+| 4 | `POST /account/change_position_mode` | sent `marginCoin`; docs list `positionMode` only | extra param removed |
+| 5 | `POST /trade/cancel_orders` | sent only `orderList`; `symbol` is **required** | `symbol` added |
+| 6 | `GET /trade/get_pending_orders` | sent `page`/`pageSize`; docs say `skip`/`limit` | params corrected |
+| 7 | `GET /trade/get_history_orders` | same | params corrected |
+| 8 | `GET /trade/get_history_trades` | same | params corrected |
+| 9 | `GET /position/get_history_positions` | same | params corrected |
+| 10 | `POST /trade/place_order` | `**kwargs` passthrough with no validation | required set enforced |
+| 11 | `POST /trade/modify_order` | `**kwargs` passthrough with no validation | required set enforced |
+
+**Deliberately out of scope** (listed, not silently skipped): the three
+`/api/v1/cp/asset/*` copy-trading endpoints — sub-account asset query and fund
+transfers are not a trading-agent concern.
+
+**Unverified:** every private endpoint needs `BITUNIX_API_KEY`/`SECRET`, which
+are not present in the build sandbox. The private handshake was **not** exercised
+against the live server and is not claimed to work.
+
+Verify: `python scripts/verify_api_contract.py`
+
+---
+
 ## The 4 TP/SL methods
 
 These are the four from the official academy article *"Bitunix Futures

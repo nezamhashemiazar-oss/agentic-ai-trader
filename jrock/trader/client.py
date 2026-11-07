@@ -313,15 +313,47 @@ class BitunixClient:
                                   body={"symbol": symbol, "marginMode": margin_mode.upper(),
                                         "marginCoin": margin_coin})
 
-    async def change_position_mode(self, position_mode: str, margin_coin: str = "USDT") -> Any:
-        return await self.request("POST", "/api/v1/futures/account/change_position_mode",
-                                  body={"positionMode": position_mode.upper(),
-                                        "marginCoin": margin_coin})
+    async def change_position_mode(self, position_mode: str) -> Any:
+        """Switch between one-way and hedge mode.
 
-    async def get_leverage_and_margin_mode(self, symbol: str | None = None,
+        Official: `positionMode` is the ONLY request parameter. The old
+        signature also sent `marginCoin`, which the docs do not list - an
+        undocumented extra field.
+        """
+        return await self.request("POST", "/api/v1/futures/account/change_position_mode",
+                                  body={"positionMode": position_mode.upper()})
+
+    async def get_leverage_and_margin_mode(self, symbol: str,
                                            margin_coin: str = "USDT") -> Any:
-        return await self.request("GET", "/api/v1/futures/account/leverage_margin_mode",
+        """Leverage and margin mode for one symbol.
+
+        Official path is `/api/v1/futures/account/get_leverage_margin_mode`
+        (with the `get_` prefix). The old code called
+        `/api/v1/futures/account/leverage_margin_mode`, which is not a
+        documented path. Both `symbol` and `marginCoin` are REQUIRED.
+        """
+        return await self.request("GET", "/api/v1/futures/account/get_leverage_margin_mode",
                                   params={"symbol": symbol, "marginCoin": margin_coin})
+
+    async def get_position_mode(self) -> Any:
+        """The account's futures position mode (one-way or hedge).
+
+        Official: `GET /api/v1/futures/account/position_mode`, no parameters.
+        """
+        return await self.request("GET", "/api/v1/futures/account/position_mode")
+
+    async def get_trading_settings(self, symbols: str | None = None) -> Any:
+        """Per-symbol margin mode and leverage.
+
+        Official: `GET /api/v1/futures/account/trading_settings`; `symbols` is
+        optional (comma-separated, max 50). Omit it to get every configured
+        symbol.
+        """
+        params: dict[str, Any] = {}
+        if symbols:
+            params["symbols"] = symbols
+        return await self.request("GET", "/api/v1/futures/account/trading_settings",
+                                  params=params)
 
     async def adjust_position_margin(self, symbol: str, amount: str,
                                      position_id: str | None = None,
@@ -355,12 +387,13 @@ class BitunixClient:
         return await self.request("GET", "/api/v1/futures/position/get_pending_positions",
                                   params={"symbol": symbol, "positionId": position_id})
 
-    async def get_history_positions(self, symbol: str | None = None, page: int = 1,
-                                    page_size: int = 20,
+    async def get_history_positions(self, symbol: str | None = None, skip: int = 0,
+                                    limit: int = 20,
                                     start_time: int | None = None,
                                     end_time: int | None = None) -> Any:
+        """Closed positions. Official paging params are `skip`/`limit`."""
         return await self.request("GET", "/api/v1/futures/position/get_history_positions",
-                                  params={"symbol": symbol, "page": page, "pageSize": page_size,
+                                  params={"symbol": symbol, "skip": skip, "limit": limit,
                                           "startTime": start_time, "endTime": end_time})
 
     async def get_position_tiers(self, symbol: str) -> Any:
@@ -368,8 +401,24 @@ class BitunixClient:
                                   params={"symbol": symbol}, signed=False)
 
     # ============================================================ TRADE
+    # Official required params for place_order, from the docs. Validated here so
+    # a malformed order is refused locally instead of costing a round trip.
+    PLACE_ORDER_REQUIRED = ("symbol", "qty", "side", "tradeSide", "orderType")
+    MODIFY_ORDER_REQUIRED = ("qty", "price")
+
     async def place_order(self, **kwargs) -> Any:
-        """Required: symbol, qty, side, tradeSide, orderType."""
+        """Place an order.
+
+        Official required: symbol, qty, side, tradeSide, orderType.
+        Optional: price, positionId, effect, clientId, reduceOnly, and the
+        tp*/sl* family. The body is passed through verbatim, but the required
+        set is checked first.
+        """
+        missing = [k for k in self.PLACE_ORDER_REQUIRED if not kwargs.get(k)]
+        if missing:
+            raise ValueError(
+                f"place_order is missing required parameter(s): {', '.join(missing)} "
+                f"(official required: {', '.join(self.PLACE_ORDER_REQUIRED)})")
         return await self.request("POST", "/api/v1/futures/trade/place_order", body=kwargs)
 
     async def batch_order(self, symbol: str, order_list: list[dict]) -> Any:
@@ -389,27 +438,55 @@ class BitunixClient:
         return await self.request("POST", "/api/v1/futures/trade/batch_order",
                                   body={"symbol": symbol, "orderList": order_list})
 
-    async def cancel_orders(self, order_list: list[dict]) -> Any:
+    async def cancel_orders(self, symbol: str, order_list: list[dict]) -> Any:
+        """Cancel a batch of orders.
+
+        Official: BOTH `symbol` and `orderList` are required. The old signature
+        sent only orderList, so every call was missing a required parameter.
+        """
+        if not symbol:
+            raise ValueError("cancel_orders requires symbol (official: required)")
+        if not order_list:
+            raise ValueError("cancel_orders requires a non-empty orderList")
         return await self.request("POST", "/api/v1/futures/trade/cancel_orders",
-                                  body={"orderList": order_list})
+                                  body={"symbol": symbol, "orderList": order_list})
 
     async def cancel_all_orders(self, symbol: str | None = None) -> Any:
         return await self.request("POST", "/api/v1/futures/trade/cancel_all_orders",
                                   body={"symbol": symbol} if symbol else {})
 
     async def modify_order(self, **kwargs) -> Any:
+        """Modify a pending order.
+
+        Official required: qty, price. Optional: orderId or clientId (one of
+        them identifies the order), plus the tp*/sl* family.
+        """
+        missing = [k for k in self.MODIFY_ORDER_REQUIRED if not kwargs.get(k)]
+        if missing:
+            raise ValueError(
+                f"modify_order is missing required parameter(s): {', '.join(missing)} "
+                f"(official required: {', '.join(self.MODIFY_ORDER_REQUIRED)})")
+        if not kwargs.get("orderId") and not kwargs.get("clientId"):
+            raise ValueError("modify_order needs orderId or clientId")
         return await self.request("POST", "/api/v1/futures/trade/modify_order", body=kwargs)
 
-    async def get_pending_orders(self, symbol: str | None = None, page: int = 1,
-                                 page_size: int = 20) -> Any:
-        return await self.request("GET", "/api/v1/futures/trade/get_pending_orders",
-                                  params={"symbol": symbol, "page": page, "pageSize": page_size})
+    async def get_pending_orders(self, symbol: str | None = None, skip: int = 0,
+                                 limit: int = 20) -> Any:
+        """Pending orders.
 
-    async def get_history_orders(self, symbol: str | None = None, page: int = 1,
-                                 page_size: int = 20, start_time: int | None = None,
+        Official paging params are `skip`/`limit` (max 100), NOT
+        `page`/`pageSize` - the live server ignores the latter and returns the
+        default page.
+        """
+        return await self.request("GET", "/api/v1/futures/trade/get_pending_orders",
+                                  params={"symbol": symbol, "skip": skip, "limit": limit})
+
+    async def get_history_orders(self, symbol: str | None = None, skip: int = 0,
+                                 limit: int = 20, start_time: int | None = None,
                                  end_time: int | None = None) -> Any:
+        """Order history. Official paging params are `skip`/`limit`."""
         return await self.request("GET", "/api/v1/futures/trade/get_history_orders",
-                                  params={"symbol": symbol, "page": page, "pageSize": page_size,
+                                  params={"symbol": symbol, "skip": skip, "limit": limit,
                                           "startTime": start_time, "endTime": end_time})
 
     async def get_order_detail(self, order_id: str | None = None,
@@ -417,11 +494,12 @@ class BitunixClient:
         return await self.request("GET", "/api/v1/futures/trade/get_order_detail",
                                   params={"orderId": order_id, "clientId": client_id})
 
-    async def get_history_trades(self, symbol: str | None = None, page: int = 1,
-                                 page_size: int = 20, start_time: int | None = None,
+    async def get_history_trades(self, symbol: str | None = None, skip: int = 0,
+                                 limit: int = 20, start_time: int | None = None,
                                  end_time: int | None = None) -> Any:
+        """Trade history. Official paging params are `skip`/`limit`."""
         return await self.request("GET", "/api/v1/futures/trade/get_history_trades",
-                                  params={"symbol": symbol, "page": page, "pageSize": page_size,
+                                  params={"symbol": symbol, "skip": skip, "limit": limit,
                                           "startTime": start_time, "endTime": end_time})
 
     async def close_all_position(self, symbol: str | None = None) -> Any:

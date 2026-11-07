@@ -110,13 +110,20 @@ _add(Endpoint("change_margin_mode", "POST", "/api/v1/futures/account/change_marg
                _p("marginCoin", "string", True)], "change_margin_mode.md"))
 _add(Endpoint("change_position_mode", "POST", "/api/v1/futures/account/change_position_mode", True,
               "10 req/sec/uid", "HEDGE | ONE_WAY",
-              [_p("positionMode", "string", True), _p("marginCoin", "string", True)],
+              [_p("positionMode", "string", True)],
               "change_position_mode.md"))
 _add(Endpoint("get_leverage_and_margin_mode", "GET",
-              "/api/v1/futures/account/leverage_margin_mode", True, "10 req/sec/uid",
+              "/api/v1/futures/account/get_leverage_margin_mode", True, "10 req/sec/uid",
               "Current leverage + margin mode",
-              [_p("symbol", "string", False), _p("marginCoin", "string", False)],
+              [_p("symbol", "string", True), _p("marginCoin", "string", True)],
               "get_leverage_and_margin_mode.md"))
+_add(Endpoint("get_position_mode", "GET", "/api/v1/futures/account/position_mode", True,
+              "20 req/sec/uid", "The account's futures position mode (one-way or hedge)",
+              [], "get_position_mode.md"))
+_add(Endpoint("get_trading_settings", "GET", "/api/v1/futures/account/trading_settings", True,
+              "20 req/sec/uid", "Per-symbol margin mode and leverage",
+              [_p("symbols", "string", False, "comma-separated, max 50; omit for all")],
+              "get_trading_settings.md"))
 _add(Endpoint("adjust_position_margin", "POST",
               "/api/v1/futures/account/adjust_position_margin", True, "5 req/sec/uid",
               "Add/remove isolated margin (side OR positionId required)",

@@ -1356,7 +1356,7 @@ class TraderEngine:
 
     async def positions_history(self, n: int = 20) -> list[dict]:
         try:
-            data = await self.client.get_history_positions(page=1, page_size=n)
+            data = await self.client.get_history_positions(skip=0, limit=n)
             return data or []
         except BitunixAPIError as e:
             self.state.errors.append(f"positions_history: {e}")

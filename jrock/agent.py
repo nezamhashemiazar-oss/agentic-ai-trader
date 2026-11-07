@@ -65,6 +65,7 @@ AGENT COMMANDS
   /batch                    batch-order status (orderList max 5, symbol required)
   /leverage                 leverage and margin mode per symbol
   /margin                   margin mode (ISOLATION|CROSS) per symbol
+  /settings [SYMBOL...]     account trading settings + position mode (one-way/hedge)
   /pnl                      unrealized PnL across open positions
   /status                   engine + API + account summary
   /symbols                  tradable symbols (or search: /symbols BTC)
@@ -142,6 +143,7 @@ AGENT_BARE: dict[str, str] = {
     "batch": "/batch", "batch_order": "/batch",
     "leverage": "/leverage", "lev": "/leverage",
     "margin": "/margin", "margin_mode": "/margin",
+    "settings": "/settings", "trading_settings": "/settings", "position_mode": "/settings",
     "pnl": "/pnl", "p&l": "/pnl",
     "status": "/status", "report": "/status",
     "symbols": "/symbols", "pairs": "/symbols", "markets": "/symbols",
@@ -548,6 +550,8 @@ class JRockAgent:
             return await self.cmd_leverage(rest)
         if cmd == "/margin":
             return await self.cmd_margin(rest)
+        if cmd == "/settings":
+            return await self.cmd_settings(rest)
         if cmd == "/pnl":
             return await self.cmd_pnl()
         if cmd == "/status":
@@ -1316,6 +1320,47 @@ class JRockAgent:
 
     async def cmd_margin(self, rest: str = "") -> str:
         return await self.cmd_leverage(rest)
+
+    async def cmd_settings(self, rest: str = "") -> str:
+        """Account trading settings and position mode.
+
+        Covers the two endpoints added by the API-contract audit:
+          GET /api/v1/futures/account/trading_settings  (per-symbol margin mode + leverage)
+          GET /api/v1/futures/account/position_mode     (one-way or hedge)
+        """
+        from .trader.errors import BitunixAPIError
+        if not self._has_bitunix_keys():
+            return missing_keys_message()
+        lines = ["=== account trading settings ==="]
+        try:
+            mode = await self.engine.client.get_position_mode()
+            pm = (mode or {}).get("positionMode") if isinstance(mode, dict) else mode
+            lines.append(f"position mode: {pm}")
+        except BitunixAPIError as e:
+            lines.append(f"position mode: error {e.code}: {e.msg or e}")
+        except Exception as e:  # noqa: BLE001
+            lines.append(f"position mode: {type(e).__name__}: {e}")
+
+        syms = [x.strip().upper() for x in rest.replace(",", " ").split() if x.strip()]
+        try:
+            data = await self.engine.client.get_trading_settings(
+                ",".join(syms) if syms else None)
+        except BitunixAPIError as e:
+            lines.append(f"trading settings: error {e.code}: {e.msg or e}")
+            return "\n".join(lines)
+        except Exception as e:  # noqa: BLE001
+            lines.append(f"trading settings: {type(e).__name__}: {e}")
+            return "\n".join(lines)
+
+        rows = data if isinstance(data, list) else ([data] if data else [])
+        if not rows:
+            lines.append("trading settings: none configured")
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            lines.append(f"  {r.get('symbol')}: leverage={r.get('leverage')}x "
+                         f"marginMode={r.get('marginMode')}")
+        return "\n".join(lines)
 
     async def cmd_pnl(self) -> str:
         from .trader.errors import BitunixAPIError
