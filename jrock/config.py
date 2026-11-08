@@ -119,6 +119,22 @@ class Settings:
     min_margin_usdt: float = 0.0
     max_margin_usdt: float = 0.0
     max_notional_usdt: float = 0.0
+    #: How much of the SPENDABLE balance one position may lock as margin, in
+    #: percent. This is the user-facing size knob: "use at most this share of my
+    #: available balance per trade". 10 = a single position may lock 10% of the
+    #: available balance as margin, so ten positions could be open at once.
+    #:
+    #: It is a MARGIN budget, not a notional budget, because margin is what the
+    #: exchange actually deducts from `available` - so the number set here is
+    #: the number the user sees leave their balance. The notional it implies is
+    #: `margin * leverage`, minus the taker fee.
+    #:
+    #: It composes with the balance cap by taking the MINIMUM of the two
+    #: notionals, so it can only ever make an order smaller; it can never talk
+    #: the engine into an order the balance cannot pay for. 0 disables it and
+    #: restores the pre-existing behaviour (size purely by risk_pct, capped by
+    #: the whole spendable balance).
+    margin_amount_pct: float = 10.0
     #: Taker fee rate charged on a MARKET order, as a fraction of notional.
     #: Bitunix USDT-M futures VIP 0 is 0.0006 (0.06%). The engine must reserve
     #: this on top of the initial margin, because the exchange deducts both from
@@ -233,6 +249,7 @@ def load_settings(env_file: str | os.PathLike | None = None) -> Settings:
         min_margin_usdt=_f("MIN_MARGIN_USDT", 0.0),
         max_margin_usdt=_f("MAX_MARGIN_USDT", 0.0),
         max_notional_usdt=_f("MAX_NOTIONAL_USDT", 0.0),
+        margin_amount_pct=_f("MARGIN_AMOUNT_PCT", 10.0),
         taker_fee_rate=_f("TAKER_FEE_RATE", 0.0006),
         margin_safety_pct=_f("MARGIN_SAFETY_PCT", 2.0),
         max_memory_items=_i("MAX_MEMORY_ITEMS", 5000),

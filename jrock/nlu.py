@@ -228,6 +228,28 @@ def _b_risk_set(t: str) -> Intent:
                   describe=f"set risk per trade to {n}% of equity")
 
 
+def _b_margin_amount_set(t: str) -> Intent:
+    """\"use 10% of my balance per trade\" - set MARGIN_AMOUNT_PCT.
+
+    The number is the share of the available balance one position may lock as
+    margin, so it is a size knob, not a risk knob. It is destructive because it
+    changes how much money the next entry commits.
+    """
+    n = _num_after(t, "margin", "amount", "pct", "percent", "to", "at", "use")
+    if n is None:
+        return Intent("margin_amount_set", "", 0.5, needs="margin percentage",
+                      describe="set the margin amount per trade")
+    return Intent("margin_amount_set", f"margin amount {n}", 0.9, destructive=True,
+                  describe=(f"use {n:g}% of the available balance as margin "
+                            f"per trade (applies on the next entry)"))
+
+
+def _b_margin_amount_read(t: str) -> Intent:
+    """A question about how much of the balance a trade uses."""
+    return Intent("margin_amount_read", "settings trade", 0.85,
+                  describe="show the margin-amount-per-trade setting")
+
+
 def _b_autotrade_on(t: str) -> Intent:
     return Intent("autotrade_on", "start trading", 0.95, destructive=True,
                   describe="turn autotrade ON - signals will be executed with real money")
@@ -342,6 +364,8 @@ _SETTING_ALIASES: dict[str, tuple[str, ...]] = {
                        "fee rate", "trading fee"),
     "MARGIN_SAFETY_PCT": ("margin_safety_pct", "margin safety pct",
                           "margin safety", "safety pct", "safety buffer"),
+    "MARGIN_AMOUNT_PCT": ("margin_amount_pct", "margin amount pct",
+                          "margin amount", "margin per trade", "margin pct"),
 }
 
 
@@ -491,6 +515,23 @@ RULES: list[tuple[str, re.Pattern, object]] = [
 
     # --- risk
     ("risk_set", re.compile(r"\b(set|change|make|put)\b.*\brisk\b", re.I), _b_risk_set),
+
+    # --- margin amount per trade (MARGIN_AMOUNT_PCT). Must beat the generic
+    # "margin mode" rule below, which would otherwise read "margin" alone.
+    ("margin_amount_set", re.compile(
+        r"\b(set|change|use|make|put|trade with|size)\b.*\b(margin amount|margin pct|"
+        r"margin percent|margin per trade|margin percentage)\b", re.I),
+     _b_margin_amount_set),
+    ("margin_amount_set", re.compile(
+        r"\b(margin amount|margin pct|margin percent|margin per trade|"
+        r"margin percentage)\b.*\b(to|at|=)\s*\d+", re.I), _b_margin_amount_set),
+    ("margin_amount_set", re.compile(
+        r"\b(use|trade with|risk)\b.*\b\d+(?:\.\d+)?\s*%\b.*\b(balance|equity|"
+        r"account|per trade|each trade)\b", re.I), _b_margin_amount_set),
+    ("margin_amount_read", re.compile(
+        r"\b(show|what|whats|what's|display|print|see|check|get|tell|my|how much)\b"
+        r".*\b(margin amount|margin pct|margin percent|margin per trade|"
+        r"margin percentage)\b", re.I), _b_margin_amount_read),
 
     # --- autotrade
     ("autotrade_on", re.compile(
@@ -701,6 +742,9 @@ def _options_for(intent: Intent) -> list[str]:
         return ["set leverage to 5x", "set leverage to 10x", "never mind"]
     if intent.name == "risk_set":
         return ["set risk to 1%", "set risk to 2%", "never mind"]
+    if intent.name == "margin_amount_set":
+        return ["use 10% of my balance per trade", "use 20% of my balance per trade",
+                "never mind"]
     if intent.name == "margin_mode":
         return ["set margin mode to ISOLATION", "set margin mode to CROSS", "never mind"]
     if intent.name == "position_mode":

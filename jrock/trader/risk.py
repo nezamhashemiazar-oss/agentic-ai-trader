@@ -401,10 +401,59 @@ def roi_pct(entry: float, price: float, side: str, leverage: int) -> float:
     return raw * leverage * 100.0
 
 
+def margin_budget(equity: float, margin_pct: float,
+                  safety_pct: float = 0.0) -> float:
+    """The margin a single order may lock, as a percent of the spendable balance.
+
+    ``MARGIN_AMOUNT_PCT`` is the user-facing knob: "risk at most this share of
+    my available balance as margin on one position". It is deliberately a
+    MARGIN budget, not a notional budget, because margin is what the exchange
+    actually deducts from `available` when the order lands - so the number the
+    user sets is the number they see disappear from their balance.
+
+    The safety headroom is applied here as well as in
+    ``max_notional_for_balance`` so the two caps agree: the budget is already
+    net of the reserve, and the notional cap derived from the same equity is
+    too, so neither can be the looser of the two by accident.
+
+    ``margin_pct <= 0`` disables the budget (returns the whole equity), which
+    keeps the pre-existing behaviour for anyone who has not set the knob.
+    """
+    if equity <= 0:
+        return 0.0
+    usable = equity * (1.0 - max(0.0, min(0.9, safety_pct / 100.0)))
+    if margin_pct <= 0:
+        return usable
+    return usable * (min(100.0, margin_pct) / 100.0)
+
+
+def max_notional_for_margin(margin_usdt: float, leverage: int,
+                            fee_rate: float = TAKER_FEE_RATE) -> float:
+    """Largest notional whose margin PLUS entry fee fits `margin_usdt`.
+
+    Same arithmetic as ``max_notional_for_balance``, but the budget is an
+    explicit margin amount rather than the whole balance::
+
+        notional/leverage + notional*fee_rate <= margin_usdt
+        notional <= margin_usdt / (1/leverage + fee_rate)
+
+    The fee term is kept because the exchange charges margin and fee together
+    from the same balance; dropping it is what produced 20003.
+    """
+    if margin_usdt <= 0 or leverage <= 0:
+        return 0.0
+    lev = max(1, int(leverage))
+    denom = 1.0 / lev + max(0.0, fee_rate)
+    if denom <= 0:
+        return 0.0
+    return margin_usdt / denom
+
+
 def position_size_by_risk(equity: float, risk_pct: float, entry: float,
                           stop: float, leverage: int, rules: PairRules,
                           fee_rate: float = TAKER_FEE_RATE,
-                          safety_pct: float = 0.0) -> float:
+                          safety_pct: float = 0.0,
+                          margin_pct: float = 0.0) -> float:
     """Size so that hitting the stop loses ~risk_pct of equity.
 
     The size is capped by what the balance can actually PAY FOR, not by
@@ -412,13 +461,28 @@ def position_size_by_risk(equity: float, risk_pct: float, entry: float,
     so the cap is ``max_notional_for_balance`` - using ``equity * leverage``
     made margin equal the whole balance, the local pre-flight passed, and the
     exchange rejected the order with 20003 once it added the fee.
+
+    ``margin_pct`` (``MARGIN_AMOUNT_PCT``) adds a SECOND, tighter cap: the
+    margin locked by this one order may not exceed that percent of the
+    spendable balance. It composes with the balance cap by taking the MINIMUM
+    of the two notionals, so it can only ever make the order smaller - it can
+    never talk the engine into an order the balance cannot pay for. The
+    risk-based size is applied first and then clamped, so a wide stop still
+    cannot push the margin past the budget.
     """
     stop_dist = abs(entry - stop)
     if stop_dist <= 0 or entry <= 0:
         return 0.0
     risk_usd = equity * (risk_pct / 100.0)
     qty = risk_usd / stop_dist
+    # Cap 1: what the whole spendable balance can pay for (margin + fee).
     max_notional = max_notional_for_balance(equity, leverage, fee_rate, safety_pct)
+    # Cap 2: the configured share of the balance, as margin. Never looser than
+    # cap 1, because both are derived from the same equity and the same reserve.
+    if margin_pct > 0:
+        budget = margin_budget(equity, margin_pct, safety_pct)
+        max_notional = min(max_notional,
+                           max_notional_for_margin(budget, leverage, fee_rate))
     qty = min(qty, max_notional / entry)
     qty = round_step(qty, rules.base_precision)
     if qty < rules.min_trade_volume:
