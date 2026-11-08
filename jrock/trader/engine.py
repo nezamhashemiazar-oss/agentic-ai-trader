@@ -35,7 +35,8 @@ from .order_builder import (OrderValidationError, build_order_body,
 from .price_cache import PriceCache
 from .risk import (PairRules, Tier, TpSlSideError, clamp_sl, clamp_tp,
                    fee_for_notional, format_price, format_qty, margin_required,
-                   max_notional_for_balance, position_size_by_risk,
+                   max_leverage_for_stop, max_notional_for_balance,
+                   position_size_by_risk,
                    qty_from_notional, qty_from_unit, required_cost, roi_pct,
                    round_price, round_step, spendable_balance,
                    tier_for_leverage, tier_leverage_violation, tick_size,
@@ -785,6 +786,67 @@ class TraderEngine:
             return {"ok": False, "reason": "no available balance"}
 
         tiers = await self.load_tiers(sym)
+
+        # --- leverage feasibility against the STOP, not just the balance.
+        #
+        # A stop must sit strictly between the liquidation price and the
+        # mark-side limit. The liquidation price is derived from the ENTRY, and
+        # a MARKET order fills at the last price - which can be on the far side
+        # of the mark. At 100x with a 0.5% maintenance margin the liquidation
+        # price lands ~0.5% below the entry, so when the mark already sits
+        # 1.3% below the last price the liquidation price is ABOVE the mark and
+        # there is no room for a stop at all. The engine then raised
+        # "no valid stop-loss exists" on every scan, forever, for a symbol it
+        # could have traded perfectly well at a lower leverage.
+        #
+        # The worst-case fill is the price that makes the liquidation price
+        # closest to the mark: the HIGHER of last/mark for a LONG, the LOWER
+        # for a SHORT. Solving the liquidation formula for L gives the highest
+        # leverage at which a stop still fits.
+        worst_entry = max(price, mark) if side == "LONG" else min(price, mark)
+        lev_tier = tier_for_leverage(tiers, self.state.leverage) or pick_tier(tiers, 0.0)
+        max_lev_for_stop = max_leverage_for_stop(
+            entry=worst_entry, mark=mark, side=side,
+            maintenance_margin_rate=lev_tier.maintenance_margin_rate,
+            rules=rules, min_ticks=self.s.tpsl_min_stop_ticks)
+
+        if max_lev_for_stop <= 0:
+            msg = (f"{sym}: no stop-loss can fit at any leverage - the mark "
+                   f"price {mark:.{rules.quote_precision}f} has already moved "
+                   f"past the entry {price:.{rules.quote_precision}f} by more "
+                   f"than the maintenance margin allows. Wait for the price to "
+                   f"come back, or skip this signal.")
+            self.state.errors.append(f"preflight {sym}: {msg}")
+            return {"ok": False, "reason": msg}
+
+        if self.state.leverage > max_lev_for_stop:
+            if self.s.leverage_auto_reduce:
+                # Clamp to the highest leverage that still leaves room for a
+                # stop. This is the difference between "the bot never trades
+                # this symbol" and "the bot trades it at a sane leverage".
+                log.warning(
+                    "%s: leverage %dx leaves no room for a stop-loss between "
+                    "the liquidation price and the mark %s (entry %s) - "
+                    "reducing to %dx for this order",
+                    sym, self.state.leverage, mark, price, max_lev_for_stop)
+                self.state.errors.append(
+                    f"leverage {sym}: {self.state.leverage}x leaves no room for "
+                    f"a stop-loss (mark {mark:.{rules.quote_precision}f}, entry "
+                    f"{price:.{rules.quote_precision}f}); using "
+                    f"{max_lev_for_stop}x for this order")
+                self.state.leverage = max_lev_for_stop
+            else:
+                msg = (f"leverage {self.state.leverage}x leaves no room for a "
+                       f"stop-loss on {sym}: the stop must sit between the "
+                       f"liquidation price and the mark "
+                       f"{mark:.{rules.quote_precision}f} (entry "
+                       f"{price:.{rules.quote_precision}f}), and at "
+                       f"{self.state.leverage}x the liquidation price is already "
+                       f"past the mark. The highest leverage that still fits is "
+                       f"{max_lev_for_stop}x. Lower the leverage, or set "
+                       f"LEVERAGE_AUTO_REDUCE=true to let the engine clamp it.")
+                self.state.errors.append(f"preflight {sym}: {msg}")
+                return {"ok": False, "reason": msg}
 
         # The largest notional this balance can actually PAY FOR at the
         # configured leverage - margin PLUS the taker fee, with the safety

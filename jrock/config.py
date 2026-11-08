@@ -82,6 +82,19 @@ class Settings:
     #: (1 tick = 10^-quotePrecision). Prevents rounding from collapsing a stop
     #: onto the mark price, which the exchange rejects with 30029/30031.
     tpsl_min_stop_ticks: int = 3
+    #: When the configured leverage leaves no room for a stop-loss between the
+    #: liquidation price and the mark price, clamp the leverage for that order
+    #: to the highest value that still fits instead of refusing the trade.
+    #:
+    #: A stop must sit strictly between the liquidation price and the mark. The
+    #: liquidation price is derived from the ENTRY, and a MARKET order fills at
+    #: the last price, which can be on the far side of the mark. At 100x with a
+    #: 0.5% maintenance margin the liquidation price is only ~0.5% below the
+    #: entry, so a mark 1.3% below the last price puts the liquidation price
+    #: ABOVE the mark - no stop can exist, and the engine refused the symbol on
+    #: every scan forever. With this on, the order is placed at the highest
+    #: leverage that still leaves room for a stop.
+    leverage_auto_reduce: bool = True
     #: Which price the exchange compares a TP/SL trigger against.
     #:   MARK_PRICE - the exchange mark price (Bitunix default, and what the
     #:                engine has always sent)
@@ -214,6 +227,7 @@ def load_settings(env_file: str | os.PathLike | None = None) -> Settings:
         kline_max_age_mult=_f("KLINE_MAX_AGE_SEC", 2.0),
         kline_cache_max=_i("KLINE_CACHE_MAX", 500),
         tpsl_min_stop_ticks=_i("TP_SL_MIN_STOP_TICKS", 3),
+        leverage_auto_reduce=_b("LEVERAGE_AUTO_REDUCE", True),
         tp_sl_trigger_type=_tp_sl_trigger_type(),
         order_unit=_order_unit(),
         min_margin_usdt=_f("MIN_MARGIN_USDT", 0.0),

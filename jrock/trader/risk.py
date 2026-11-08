@@ -343,6 +343,44 @@ def liquidation_price(entry: float, leverage: int, side: str,
     return max(p, 0.0)
 
 
+def max_leverage_for_stop(*, entry: float, mark: float, side: str,
+                          maintenance_margin_rate: float,
+                          rules: "PairRules", min_ticks: int = 3) -> int:
+    """Highest leverage at which a valid stop-loss can still fit.
+
+    A stop must sit strictly between the liquidation price and the mark-side
+    limit, keeping `min_ticks` clear of both. The limit is the WORSE of the
+    entry and the mark, exactly as `clamp_sl` uses it:
+
+        LONG : limit = min(entry, mark) - d,  need liq < limit
+        SHORT: limit = max(entry, mark) + d,  need liq > limit
+
+    At high leverage the liquidation price creeps toward the entry, and once it
+    crosses that limit there is no room left at all - the position would be
+    liquidated the moment it opened. Solving the liquidation formula for L:
+
+        LONG : L < 1 / (1 + mmr - limit/entry)
+        SHORT: L < 1 / (limit/entry - 1 + mmr)
+
+    Returns 0 when no leverage works, which happens only when the mark has
+    moved past the entry by more than the maintenance margin allows (at 1x the
+    liquidation price is just `mmr` away from the entry).
+    """
+    if entry <= 0 or mark <= 0:
+        return 0
+    d = min_stop_distance(rules, min_ticks)
+    mmr = max(0.0, maintenance_margin_rate)
+    if side.upper() in ("LONG", "BUY"):
+        limit = min(entry, mark) - d
+        denom = 1.0 + mmr - limit / entry
+    else:
+        limit = max(entry, mark) + d
+        denom = limit / entry - 1.0 + mmr
+    if denom <= 0:
+        return 0
+    return max(0, int(1.0 / denom))
+
+
 def sl_from_liq_distance(entry: float, liq: float, side: str,
                          distance_pct: float = 50.0) -> float:
     """Stop loss placed `distance_pct` of the way from entry toward liq price.
