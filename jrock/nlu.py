@@ -165,6 +165,16 @@ def _b_pnl(t: str) -> Intent:
     return Intent("pnl", "pnl", 0.95, describe="show unrealized PnL")
 
 
+def _b_pnl_strong(t: str) -> Intent:
+    """"how are my trades doing" - a PnL question, not a positions listing.
+
+    It contains "my trades", so the positions rule also matches; the higher
+    confidence here makes the PnL reading win instead of asking the user to
+    disambiguate a question that has an obvious answer.
+    """
+    return Intent("pnl", "pnl", 0.97, describe="show unrealized PnL")
+
+
 def _b_status(t: str) -> Intent:
     return Intent("status", "status", 0.9, describe="show engine status")
 
@@ -322,6 +332,19 @@ def _b_why_failed(t: str) -> Intent:
                   describe="explain the last error")
 
 
+#: Friendly names a user may use for a setting defined in this repo, mapped to
+#: the canonical name. A question about a known setting is answered from the
+#: repo, never by the model.
+_SETTING_ALIASES: dict[str, tuple[str, ...]] = {
+    "TP_SL_MIN_STOP_TICKS": ("tp_sl_min_stop_ticks", "min stop ticks",
+                             "stop ticks", "min stop distance"),
+    "TAKER_FEE_RATE": ("taker_fee_rate", "taker fee rate", "taker fee",
+                       "fee rate", "trading fee"),
+    "MARGIN_SAFETY_PCT": ("margin_safety_pct", "margin safety pct",
+                          "margin safety", "safety pct", "safety buffer"),
+}
+
+
 def _b_what_is(t: str) -> Intent:
     """A question about a setting defined in THIS repo.
 
@@ -329,12 +352,54 @@ def _b_what_is(t: str) -> Intent:
     TP_SL_MIN_STOP_TICKS, which is defined in jrock/config.py. A question about
     a known setting is answered from the repo, never by the model.
     """
-    m = re.search(r"\b(TP_SL_MIN_STOP_TICKS|TAKER_FEE_RATE|MARGIN_SAFETY_PCT)\b", t.upper())
-    if m:
-        return Intent("explain_setting", f"__explain__ {m.group(1)}", 0.95,
-                      describe=f"explain {m.group(1)}")
+    low = t.lower()
+    for canonical, aliases in _SETTING_ALIASES.items():
+        if any(a in low for a in aliases):
+            return Intent("explain_setting", f"__explain__ {canonical}", 0.95,
+                          describe=f"explain {canonical}")
     return Intent("explain_setting", "", 0.4, needs="which setting",
                   describe="explain a setting")
+
+
+def _b_smalltalk(t: str) -> Intent:
+    """A greeting, thanks, or "are you there".
+
+    Answered directly so a normal hello never falls through to nothing. It is
+    not destructive and does not touch the engine.
+    """
+    return Intent("smalltalk", "__smalltalk__", 0.8,
+                  describe="reply to a greeting")
+
+
+#: A single word that is still a complete message (a greeting or thanks).
+#: Without this, `parse`'s "a single word is not a sentence" guard dropped
+#: "hi", "thanks", "thx" ... and the agent answered nothing at all.
+_SMALLTALK_SINGLE = re.compile(
+    r"^\s*(hi|hello|hey|yo|hiya|howdy|thanks|thank you|thx|ty|cheers|"
+    r"good\s+(morning|afternoon|evening))\s*[!.?]*\s*$", re.I)
+
+
+def _b_risk_read(t: str) -> Intent:
+    """A question or concern about the risk setting.
+
+    "risk is too high for me" is a request to SEE the setting, not to change
+    it - the setter needs an explicit number.
+    """
+    return Intent("risk_read", "settings trade", 0.85,
+                  describe="show the risk-per-trade setting")
+
+
+def _b_account(t: str) -> Intent:
+    """"tell me about my account" - a general account question."""
+    return Intent("status", "status", 0.85, describe="show the account status")
+
+
+def _b_analysis(t: str) -> Intent:
+    """"what do you think about ETHUSDT" - show the price so the model can
+    comment on it, rather than doing nothing."""
+    syms = _symbols_in(t)
+    return Intent("price", f"price {','.join(syms)}" if syms else "price", 0.8,
+                  symbols=syms, describe="show the price and comment")
 
 
 #: Ordered rules. Specific before general.
@@ -483,6 +548,96 @@ RULES: list[tuple[str, re.Pattern, object]] = [
         r"\b(show|list|what|whats|what's|display|print|see|check|get|tell)\b"
         r".*\b(symbols?|pairs?)\b", re.I), _b_symbols),
     ("symbols", re.compile(r"\bwhat can i trade\b", re.I), _b_symbols),
+
+    # --- a bare mention of a setting/symbols, even without a read verb
+    #     ("settings look wrong", "symbols are not working")
+    ("settings", re.compile(r"\bsettings?\b", re.I), _b_settings),
+    ("symbols", re.compile(r"\bsymbols?\b", re.I), _b_symbols),
+
+    # --- risk, as a question or a concern (the setter needs a number)
+    ("risk_read", re.compile(
+        r"\brisk\b.*\b(too (high|low|much|big)|is|are|what|whats|what's|"
+        r"show|current|setting|level)\b", re.I), _b_risk_read),
+    ("risk_read", re.compile(
+        r"\b(what|whats|what's|show|my|the)\b.*\brisk\b", re.I), _b_risk_read),
+
+    # --- leverage, as a question or a concern
+    ("leverage_read", re.compile(
+        r"\bleverage\b.*\b(too (high|low|much|big)|is|are|what|whats|what's|"
+        r"show|current|setting|level|should)\b", re.I), _b_leverage_read),
+
+    # --- a general account question
+    ("status", re.compile(
+        r"\b(tell me about|how('s| is)|what about)\b.*\b(account|portfolio)\b",
+        re.I), _b_account),
+
+    # --- "what do you think about X" - show the price so the model can comment
+    ("analysis", re.compile(
+        r"\b(what do you think|your (view|take|opinion)|thoughts?|analysis|"
+        r"outlook)\b.*\b([A-Z]{2,10}USDT)\b", re.I), _b_analysis),
+
+    # --- small talk: a greeting must never "do nothing"
+    ("smalltalk", re.compile(
+        r"^\s*(hi|hello|hey|yo|hiya|howdy|good\s+(morning|afternoon|evening)|"
+        r"thanks|thank you|thx|ty|cheers|are you there|you there|"
+        r"what'?s up|what'?s going on|how are you)\b", re.I), _b_smalltalk),
+
+    # --- help, in the many ways a person asks for it
+    ("help", re.compile(
+        r"\b(help me out|i need help|need help|i'?m stuck|"
+        r"what can you do( for me)?|how can you help( me)?|"
+        r"what are you able to do|what do you do)\b", re.I), _b_help),
+
+    # --- status, phrased as a question
+    ("status", re.compile(
+        r"\b(is|are)\b.*\b(engine|bot|it|system)\b.*"
+        r"\b(running|on|up|alive|working|ok)\b", re.I), _b_status),
+    ("status", re.compile(
+        r"\b(status|state|health)\b.*\b(account|engine|bot|system|everything)\b",
+        re.I), _b_status),
+    ("status", re.compile(
+        r"\b(account|engine|bot|system)\b.*\b(status|state|health)\b", re.I),
+     _b_status),
+
+    # --- balance, in the many ways a person asks
+    ("balance", re.compile(
+        r"\b(buying power|how much can i (trade|spend|use)|"
+        r"available (balance|funds|margin)|account balance|my funds)\b",
+        re.I), _b_balance),
+
+    # --- positions / trades
+    # A close/exit verb must NOT be read as a read-only positions query, or
+    # "close my position" would be answered with a listing instead of asking
+    # which symbol to close.
+    ("positions", re.compile(
+        r"^(?!.*\b(close|exit|flatten|kill|get (me )?out of)\b)"
+        r".*\b(open trades?|my trades?|my positions?|current trades?|"
+        r"open positions?|holdings?|what am i holding)\b", re.I), _b_positions),
+
+    # --- pnl, phrased as a question
+    ("pnl", re.compile(
+        r"\b(how much (have i|did i|am i) (made|up|down|profit|loss)|"
+        r"am i (up|down|in profit|in loss)|my (profit|loss|pnl)|"
+        r"how are my trades doing|how am i doing)\b", re.I), _b_pnl_strong),
+
+    # --- autotrade off, in the many ways a person says it
+    ("autotrade_off", re.compile(
+        r"\b(turn off|switch off|shut down|shut off|stop|pause|halt|kill)\b.*"
+        r"\b(bot|trading|autotrade|auto[- ]?trading)\b", re.I), _b_autotrade_off),
+    ("autotrade_off", re.compile(
+        r"\b(pause|stop|halt|kill)\b.*\b(everything|all|it)\b", re.I),
+     _b_autotrade_off),
+
+    # --- autotrade on
+    ("autotrade_on", re.compile(
+        r"\b(resume|restart|start|turn on|switch on|enable)\b.*"
+        r"\b(bot|trading|autotrade|auto[- ]?trading)\b", re.I), _b_autotrade_on),
+
+    # --- explain a setting, phrased as a question
+    ("explain_setting", re.compile(
+        r"\b(explain|what is|what'?s|how does|tell me about|what does)\b.*"
+        r"\b(taker fee|fee rate|trading fee|margin safety|safety pct|"
+        r"min stop ticks|stop ticks|min stop distance)\b", re.I), _b_what_is),
 ]
 
 
@@ -501,7 +656,9 @@ def parse(text: str) -> Intent | Clarification | None:
     if not raw:
         return None
     # A single word is not a sentence; the existing bare-word table owns those.
-    if len(raw.split()) < 2:
+    # EXCEPT a greeting/thanks, which must still get a reply rather than
+    # falling through to nothing.
+    if len(raw.split()) < 2 and not _SMALLTALK_SINGLE.match(raw):
         return None
 
     matches: list[Intent] = []

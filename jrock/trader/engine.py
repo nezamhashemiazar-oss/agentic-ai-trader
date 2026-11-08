@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,10 +35,11 @@ from .order_builder import (OrderValidationError, build_order_body,
 from .price_cache import PriceCache
 from .risk import (PairRules, Tier, TpSlSideError, clamp_sl, clamp_tp,
                    fee_for_notional, format_price, format_qty, margin_required,
-                   max_notional_for_balance, pick_tier, position_size_by_risk,
+                   max_notional_for_balance, position_size_by_risk,
                    qty_from_notional, qty_from_unit, required_cost, roi_pct,
-                   round_price, round_step, tick_size, unit_from_qty,
-                   validate_tpsl_side)
+                   round_price, round_step, spendable_balance,
+                   tier_for_leverage, tier_leverage_violation, tick_size,
+                   unit_from_qty, validate_tpsl_side)
 from .strategies import build_strategies
 from .tpsl import (PositionState, mid_management_action, next_trailing_stop,
                    plan_tpsl, should_breakeven, should_trail)
@@ -767,11 +769,16 @@ class TraderEngine:
                         "%s (last price %s widened by the protection scope)",
                         sym, mark, price)
 
-        # account equity
+        # account balance: the SPENDABLE amount, not total equity.
+        # `available` already excludes the margin locked by open positions and
+        # the frozen amount locked by resting orders, so it is what a new order
+        # may actually spend. Sizing against total equity (available + margin +
+        # unrealized) is what made the engine believe it could afford an order
+        # the exchange then refused with 20003 Insufficient balance.
         try:
             acct = await self.client.get_single_account()
             a = acct[0] if isinstance(acct, list) and acct else (acct or {})
-            equity = float(a.get("available", 0) or 0)
+            equity = spendable_balance(a)
         except BitunixAPIError as e:
             return {"ok": False, "reason": f"account: {e}"}
         if equity <= 0:
@@ -779,32 +786,38 @@ class TraderEngine:
 
         tiers = await self.load_tiers(sym)
 
-        # The largest notional this account could open at the configured
-        # leverage. Used for tier selection: a bigger notional lands in a
-        # higher tier with a higher maintenance-margin rate, so this is the
-        # conservative choice for the liquidation estimate.
-        max_notional = equity * self.state.leverage
+        # The largest notional this balance can actually PAY FOR at the
+        # configured leverage - margin PLUS the taker fee, with the safety
+        # headroom. This is the true upper bound of the order.
+        # (`equity * leverage` ignored the fee and over-stated the bound, which
+        # also pushed the tier selection into a higher band than the real order.)
+        max_notional = max_notional_for_balance(
+            equity, self.state.leverage, self.s.taker_fee_rate,
+            self.s.margin_safety_pct)
 
-        # The tier for that notional band CAPS the leverage. Check it BEFORE
-        # planning: if the leverage is not allowed there is no valid plan, and
-        # the exchange would answer 20003 (it wants more margin than we
-        # computed) rather than a leverage error.
-        tier = pick_tier(tiers, max_notional)
-        if self.state.leverage > tier.leverage:
-            msg = (f"leverage {self.state.leverage}x exceeds the maximum "
-                   f"{tier.leverage}x allowed for a {max_notional:.2f} USDT "
-                   f"position on {sym} (risk tier {tier.level}). The exchange "
-                   f"would require "
-                   f"{margin_required(max_notional, tier.leverage):.4f} USDT "
-                   f"margin, not {margin_required(max_notional, self.state.leverage):.4f}. "
-                   f"Lower the leverage or reduce the position size.")
+        # Provisional plan: only the stop-loss is needed here, to size the
+        # order. It is built at a notional whose tier still permits the
+        # configured leverage - at a high leverage the affordable maximum can
+        # land in a tier whose maintenance-margin rate makes the liquidation
+        # formula degenerate (liq on the wrong side of entry), which would
+        # raise TpSlSideError for an order that is actually fine. The tier the
+        # REAL order notional lands in is checked after sizing.
+        prov_tier = tier_for_leverage(tiers, self.state.leverage)
+        if prov_tier is None:
+            max_lev = max((t.leverage for t in tiers), default=0)
+            msg = (f"leverage {self.state.leverage}x is above the maximum "
+                   f"{max_lev}x allowed for {sym} at any position size. "
+                   f"Lower the leverage.")
             self.state.errors.append(f"preflight {sym}: {msg}")
             return {"ok": False, "reason": msg, "hint": "20003 Insufficient balance"}
+        prov_notional = max_notional
+        if prov_tier.end_value != float("inf") and prov_tier.end_value > 0:
+            prov_notional = min(max_notional, prov_tier.end_value * 0.9999)
 
         try:
             plan = plan_tpsl(
                 side=side, entry=price, leverage=self.state.leverage,
-                notional=max_notional,
+                notional=prov_notional,
                 strength=agg.strength, confidence=agg.confidence, tiers=tiers, rules=rules,
                 liq_sl_distance_pct=self.state.liq_sl_distance_pct,
                 breakeven_pct=self.state.breakeven_pct,
@@ -840,6 +853,16 @@ class TraderEngine:
         # balance, and the engine's own bounds. Without this the request is
         # sent and the exchange answers 20003 Insufficient balance.
         notional_real = qty * price
+
+        # The tier the REAL order notional lands in caps the leverage. Checked
+        # against the actual notional, not `equity * leverage` (which lands in a
+        # higher tier and produced a bogus 20003 for an order that was fine).
+        tier_msg = tier_leverage_violation(tiers, notional_real, self.state.leverage)
+        if tier_msg:
+            msg = f"{sym}: {tier_msg}"
+            self.state.errors.append(f"preflight {sym}: {msg}")
+            return {"ok": False, "reason": msg, "hint": "20003 Insufficient balance"}
+
         margin_real = margin_required(notional_real, self.state.leverage)
         # Opening a MARKET order costs the initial margin AND a taker fee, and
         # the exchange deducts BOTH from the available balance at once. Checking
@@ -1716,6 +1739,13 @@ class TraderEngine:
 
         Deliberately strict: a natural-language sentence must NOT be swallowed
         by the engine and answered with "Unknown engine command".
+
+        The old check was `any(low.startswith(p) for p in COMMAND_PREFIXES)`,
+        which is greedy: "leverage is too high, what should I do?" starts with
+        "leverage" and was therefore treated as the `leverage` setter, so a
+        normal question got "Unknown engine command" instead of an answer. A
+        prefix only counts as a command when the REST of the line is the
+        argument shape that command actually accepts.
         """
         low = line.strip().lower()
         if not low:
@@ -1723,9 +1753,77 @@ class TraderEngine:
         if low in ("status", "pnl", "p&l", "trades_history", "tpsl_history",
                    "trades history", "tpsl history", "engine on", "engine off",
                    "start trading", "stop trading", "scan on", "scan off",
-                   "report on", "report off", "settings", "settings trade"):
+                   "report on", "report off", "settings", "settings trade",
+                   "ladder"):
             return True
-        return any(low.startswith(p) for p in self.COMMAND_PREFIXES)
+        for p in self.COMMAND_PREFIXES:
+            if not low.startswith(p):
+                continue
+            rest = low[len(p):].strip()
+            if self._is_command_argument(p, rest):
+                return True
+        return False
+
+    #: Commands whose argument is a bare number (optionally with a unit word).
+    _NUMERIC_ARG_COMMANDS: tuple[str, ...] = (
+        "leverage", "risk", "max open positions", "scans interval",
+        "report interval", "breakeven threshold", "trailing trigger",
+        "liq sl distance", "min agreeing", "min confidence",
+        "tf min confidence", "partial close pct", "partial at roi",
+        "account tp usdt", "account sl usdt", "account tp pct", "account sl pct",
+    )
+
+    def _is_command_argument(self, prefix: str, rest: str) -> bool:
+        """Whether `rest` is a valid argument for the command `prefix`.
+
+        This is what separates "leverage 20" (a command) from "leverage is too
+        high" (a sentence). A command with no argument is only valid for the
+        prefixes that are complete on their own.
+        """
+        p = prefix.strip()
+        if not rest:
+            # Bare prefixes that are complete commands on their own.
+            return p in ("status", "pnl", "p&l", "settings", "ladder",
+                         "trades_history", "tpsl_history", "trades history",
+                         "tpsl history", "symbols", "positions history",
+                         "engine on", "engine off", "scan on", "scan off",
+                         "report on", "report off", "start trading",
+                         "stop trading", "autotrade")
+        # A numeric command takes a number, optionally preceded by a unit word
+        # ("leverage to 20", "risk pct 1.5", "min confidence 70").
+        if p in self._NUMERIC_ARG_COMMANDS:
+            return bool(re.search(r"-?\d+(?:\.\d+)?", rest))
+        # Symbol lists: "symbols BTCUSDT,ETHUSDT" / "symbol BTCUSDT".
+        if p in ("symbols", "symbol"):
+            return bool(re.search(r"[A-Za-z]{2,10}USDT", rest, re.I))
+        # Mode setters take a known keyword.
+        if p == "margin mode":
+            return rest.replace(":", "").strip().upper() in ("ISOLATION", "CROSS")
+        if p == "position mode":
+            return rest.replace(":", "").strip().upper().replace(" ", "_") in (
+                "HEDGE", "ONE_WAY")
+        if p == "tpsl method":
+            return rest.split()[-1].upper() in ("POSITION", "PARTIAL",
+                                                "TRAILING", "ACCOUNT")
+        if p == "close position":
+            return bool(re.search(r"[A-Za-z]{2,10}USDT", rest, re.I))
+        if p == "ladder":
+            return rest.split()[0].lower() in ("set", "off", "none", "disable",
+                                               "clear", "breakeven", "runner",
+                                               "basis")
+        if p == "reversal":
+            return rest.strip("= ").lower() in ("true", "false", "1", "0",
+                                                "on", "off", "yes", "no")
+        if p == "mid management":
+            return True
+        if p == "timeframes":
+            return bool(re.search(r"\d+[mhd]", rest, re.I))
+        if p == "autotrade":
+            return rest.strip().lower() in ("on", "off", "enable", "disable",
+                                            "enabled", "disabled", "start", "stop")
+        if p == "report":
+            return rest.split()[0].lower() in ("on", "off", "interval")
+        return False
 
     async def command(self, line: str) -> str:
         """Route an engine command, persisting any state it changed.

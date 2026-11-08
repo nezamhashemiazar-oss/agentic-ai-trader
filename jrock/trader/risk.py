@@ -209,6 +209,68 @@ def required_cost(notional: float, leverage: int,
     return margin_required(notional, leverage) + fee_for_notional(notional, fee_rate)
 
 
+def spendable_balance(account_row: dict) -> float:
+    """The balance a NEW order may spend, from a get_single_account row.
+
+    Bitunix documents `available` as the "Available quantity in the account"
+    and states "this field + crossUnrealizedPNL = Actual maximum open amount".
+    `available` already excludes the margin locked by open positions and the
+    `frozen` amount locked by resting orders, so it is the correct number to
+    size against.
+
+    Total equity (available + margin + unrealized) is NOT: sizing against it
+    makes the engine believe it can afford an order the exchange then refuses
+    with 20003 Insufficient balance. `crossUnrealizedPNL` is spendable only for
+    CROSS positions; the engine defaults to ISOLATION, so it is deliberately
+    not added here.
+    """
+    if not isinstance(account_row, dict):
+        return 0.0
+    try:
+        return max(0.0, float(account_row.get("available", 0) or 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def tier_leverage_violation(tiers: list["Tier"], notional: float,
+                            leverage: int) -> str:
+    """Empty string when `leverage` is allowed for `notional`, else the reason.
+
+    The tier a position's notional lands in caps the leverage that may be set
+    for it. Checking this against the ACTUAL order notional is what keeps a
+    valid order from being refused: checking it against `available * leverage`
+    (a notional far larger than the order) lands in a higher tier and produces
+    a bogus 20003 Insufficient balance for an order that would have been fine.
+    """
+    t = pick_tier(tiers, notional)
+    if leverage <= t.leverage:
+        return ""
+    return (f"leverage {leverage}x exceeds the maximum {t.leverage}x allowed for "
+            f"a {notional:.2f} USDT position (risk tier {t.level}). The exchange "
+            f"would require {margin_required(notional, t.leverage):.4f} USDT "
+            f"margin, not {margin_required(notional, leverage):.4f}. "
+            f"Lower the leverage or reduce the position size.")
+
+
+def tier_for_leverage(tiers: list["Tier"], leverage: int) -> "Tier | None":
+    """The largest tier whose leverage cap still permits `leverage`.
+
+    Used to build the PROVISIONAL plan that sizes the order. The tier the final
+    notional lands in is checked separately (`tier_leverage_violation`); this
+    one only has to be a band where the configured leverage is valid, so the
+    liquidation formula does not degenerate while the size is computed.
+    Returns None when no tier allows the leverage at any size.
+    """
+    if not tiers:
+        return Tier(1, 0.0, float("inf"), 125, 0.004)
+    best: "Tier | None" = None
+    for t in tiers:
+        if t.leverage >= leverage:
+            if best is None or t.end_value > best.end_value:
+                best = t
+    return best
+
+
 #: The three order units Bitunix documents in
 #: "Explanation of the Order Units in Futures Trading":
 #:   QUANTITY - base-coin quantity (the `qty` field of place_order)

@@ -86,8 +86,13 @@ def _run(equity, mark, last, leverage):
 
 
 def test_tier_leverage_cap_refuses_before_sending():
-    """50x on a 50k notional is tier 3 (max 20x) -> 20003 if sent."""
-    r, placed = _run(1000.0, 0.005020, 0.005009, 50)
+    """A REAL order notional that lands in a tier forbidding the leverage is
+    refused locally, with no order sent.
+
+    equity 100k, risk 1%, 50x -> the risk-sized notional is ~400k, which lands
+    in the last tier (max 20x), so 50x is genuinely not allowed for it.
+    """
+    r, placed = _run(100000.0, 0.005020, 0.005009, 50)
     assert r["ok"] is False
     assert placed == [], "no order may be sent when the tier forbids the leverage"
     assert "exceeds the maximum" in r["reason"]
@@ -96,9 +101,36 @@ def test_tier_leverage_cap_refuses_before_sending():
 
 
 def test_tier_leverage_cap_names_both_margins():
-    r, _ = _run(1000.0, 0.005020, 0.005009, 50)
-    assert "2500.0000" in r["reason"]   # what the exchange would require
-    assert "1000.0000" in r["reason"]   # what we computed
+    r, _ = _run(100000.0, 0.005020, 0.005009, 50)
+    assert "19265.3844" in r["reason"]   # what the exchange would require at 20x
+    assert "7706.1538" in r["reason"]    # what we computed at 50x
+
+
+def test_valid_high_leverage_order_is_not_refused():
+    """The bug this fix removes: the tier cap was checked against
+    `equity * leverage` (a notional far larger than the order), which landed in
+    a higher tier and refused orders that were actually fine.
+
+    equity 1000, risk 1%, 50x -> the real notional is ~4k, which is tier 1
+    (max 50x), so 50x IS allowed and the order must go through.
+    """
+    r, placed = _run(1000.0, 0.005020, 0.005009, 50)
+    assert r["ok"] is True, r.get("reason")
+    assert len(placed) == 1
+    assert placed[0]["symbol"] == "AKEUSDT"
+
+
+def test_sizing_uses_available_not_total_equity():
+    """`available` is the spendable balance; total equity (available + margin +
+    unrealized) is not. Sizing against equity is what produced 20003."""
+    from jrock.trader.risk import spendable_balance
+    row = {"available": "9.3044", "frozen": "0", "margin": "50",
+           "crossUnrealizedPNL": "5", "isolationUnrealizedPNL": "0"}
+    assert spendable_balance(row) == pytest.approx(9.3044)
+    # total equity would be 64.3044 - far more than the order may spend
+    assert spendable_balance(row) < 9.3044 + 50 + 5
+    assert spendable_balance({}) == 0.0
+    assert spendable_balance({"available": "not-a-number"}) == 0.0
 
 
 def test_correctly_sized_order_passes_and_is_built():

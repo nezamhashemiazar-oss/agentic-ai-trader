@@ -688,11 +688,30 @@ class JRockAgent:
             return nlu.confirmation_prompt(intent)
         return await self._run_intent(intent)
 
+    def _smalltalk_reply(self) -> str:
+        """A warm, useful answer to a greeting - never an empty response.
+
+        The agent used to answer a plain "hi" with nothing at all, because the
+        line matched no command and the model had no engine access. A greeting
+        now gets a real reply that also says what the agent can do.
+        """
+        return ("Hey - I'm J+Rock, your Bitunix futures agent. I'm listening, "
+                "no command needed.\n"
+                "Ask me things like:\n"
+                "  - what's my balance / how much can I trade\n"
+                "  - show my positions / how are my trades doing\n"
+                "  - what's the price of BTCUSDT\n"
+                "  - is the engine running\n"
+                "  - set leverage to 10x, or start/stop trading\n"
+                "Type 'help' for the full list.")
+
     async def _run_intent(self, intent: nlu.Intent) -> str:
         """Run a resolved intent through the existing handlers."""
         # Pseudo-commands the NLU layer owns (no engine equivalent).
         if intent.command == "__why_failed__":
             return self._explain_last_error()
+        if intent.command == "__smalltalk__":
+            return self._smalltalk_reply()
         if intent.command.startswith("__explain__"):
             return self._explain_setting(intent.command.split()[-1])
         if intent.command.startswith("__place__"):
