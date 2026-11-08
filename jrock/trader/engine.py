@@ -34,8 +34,11 @@ from .order_builder import (OrderValidationError, build_order_body,
                             debug_order_enabled, log_order_body)
 from .price_cache import PriceCache
 from .risk import (PairRules, Tier, TpSlSideError, clamp_sl, clamp_tp,
-                   fee_for_notional, format_price, format_qty, margin_required,
-                   max_notional_for_balance, position_size_by_risk,
+                   fee_for_notional, format_price, format_qty, margin_budget,
+                   margin_required,
+                   max_leverage_for_stop, max_notional_for_balance,
+                   max_notional_for_margin,
+                   position_size_by_risk,
                    qty_from_notional, qty_from_unit, required_cost, roi_pct,
                    round_price, round_step, spendable_balance,
                    tier_for_leverage, tier_leverage_violation, tick_size,
@@ -65,6 +68,9 @@ class EngineState:
     position_mode: str = "ONE_WAY"
     max_open_positions: int = 3
     risk_pct: float = 1.0
+    #: Share of the spendable balance one position may lock as margin (%).
+    #: 0 disables the budget and sizes purely by risk_pct.
+    margin_amount_pct: float = 10.0
     breakeven_pct: float = 0.6
     trailing_trigger_roi_pct: float = 25.0
     liq_sl_distance_pct: float = 50.0
@@ -104,6 +110,7 @@ class TraderEngine:
             position_mode=settings.position_mode,
             max_open_positions=settings.max_open_positions,
             risk_pct=settings.risk_pct,
+            margin_amount_pct=settings.margin_amount_pct,
             breakeven_pct=settings.breakeven_pct,
             trailing_trigger_roi_pct=settings.trailing_trigger_roi_pct,
             liq_sl_distance_pct=settings.liq_sl_distance_pct,
@@ -178,7 +185,7 @@ class TraderEngine:
         "scan_on", "report_on", "report_interval", "scan_interval",
         "reversal", "reversal_confidence", "mid_management",
         "symbols", "leverage", "margin_mode", "position_mode",
-        "max_open_positions", "risk_pct", "breakeven_pct",
+        "max_open_positions", "risk_pct", "margin_amount_pct", "breakeven_pct",
         "trailing_trigger_roi_pct", "liq_sl_distance_pct",
         "min_agreeing", "timeframes", "min_confidence", "tf_min_confidence",
         "scans",
@@ -786,6 +793,67 @@ class TraderEngine:
 
         tiers = await self.load_tiers(sym)
 
+        # --- leverage feasibility against the STOP, not just the balance.
+        #
+        # A stop must sit strictly between the liquidation price and the
+        # mark-side limit. The liquidation price is derived from the ENTRY, and
+        # a MARKET order fills at the last price - which can be on the far side
+        # of the mark. At 100x with a 0.5% maintenance margin the liquidation
+        # price lands ~0.5% below the entry, so when the mark already sits
+        # 1.3% below the last price the liquidation price is ABOVE the mark and
+        # there is no room for a stop at all. The engine then raised
+        # "no valid stop-loss exists" on every scan, forever, for a symbol it
+        # could have traded perfectly well at a lower leverage.
+        #
+        # The worst-case fill is the price that makes the liquidation price
+        # closest to the mark: the HIGHER of last/mark for a LONG, the LOWER
+        # for a SHORT. Solving the liquidation formula for L gives the highest
+        # leverage at which a stop still fits.
+        worst_entry = max(price, mark) if side == "LONG" else min(price, mark)
+        lev_tier = tier_for_leverage(tiers, self.state.leverage) or pick_tier(tiers, 0.0)
+        max_lev_for_stop = max_leverage_for_stop(
+            entry=worst_entry, mark=mark, side=side,
+            maintenance_margin_rate=lev_tier.maintenance_margin_rate,
+            rules=rules, min_ticks=self.s.tpsl_min_stop_ticks)
+
+        if max_lev_for_stop <= 0:
+            msg = (f"{sym}: no stop-loss can fit at any leverage - the mark "
+                   f"price {mark:.{rules.quote_precision}f} has already moved "
+                   f"past the entry {price:.{rules.quote_precision}f} by more "
+                   f"than the maintenance margin allows. Wait for the price to "
+                   f"come back, or skip this signal.")
+            self.state.errors.append(f"preflight {sym}: {msg}")
+            return {"ok": False, "reason": msg}
+
+        if self.state.leverage > max_lev_for_stop:
+            if self.s.leverage_auto_reduce:
+                # Clamp to the highest leverage that still leaves room for a
+                # stop. This is the difference between "the bot never trades
+                # this symbol" and "the bot trades it at a sane leverage".
+                log.warning(
+                    "%s: leverage %dx leaves no room for a stop-loss between "
+                    "the liquidation price and the mark %s (entry %s) - "
+                    "reducing to %dx for this order",
+                    sym, self.state.leverage, mark, price, max_lev_for_stop)
+                self.state.errors.append(
+                    f"leverage {sym}: {self.state.leverage}x leaves no room for "
+                    f"a stop-loss (mark {mark:.{rules.quote_precision}f}, entry "
+                    f"{price:.{rules.quote_precision}f}); using "
+                    f"{max_lev_for_stop}x for this order")
+                self.state.leverage = max_lev_for_stop
+            else:
+                msg = (f"leverage {self.state.leverage}x leaves no room for a "
+                       f"stop-loss on {sym}: the stop must sit between the "
+                       f"liquidation price and the mark "
+                       f"{mark:.{rules.quote_precision}f} (entry "
+                       f"{price:.{rules.quote_precision}f}), and at "
+                       f"{self.state.leverage}x the liquidation price is already "
+                       f"past the mark. The highest leverage that still fits is "
+                       f"{max_lev_for_stop}x. Lower the leverage, or set "
+                       f"LEVERAGE_AUTO_REDUCE=true to let the engine clamp it.")
+                self.state.errors.append(f"preflight {sym}: {msg}")
+                return {"ok": False, "reason": msg}
+
         # The largest notional this balance can actually PAY FOR at the
         # configured leverage - margin PLUS the taker fee, with the safety
         # headroom. This is the true upper bound of the order.
@@ -831,7 +899,8 @@ class TraderEngine:
         qty = position_size_by_risk(equity, self.state.risk_pct, price, plan.sl,
                                     self.state.leverage, rules,
                                     fee_rate=self.s.taker_fee_rate,
-                                    safety_pct=self.s.margin_safety_pct)
+                                    safety_pct=self.s.margin_safety_pct,
+                                    margin_pct=self.state.margin_amount_pct)
         if qty <= 0:
             return {"ok": False, "reason": "computed qty is 0 (risk too small or below min volume)"}
 
@@ -886,6 +955,25 @@ class TraderEngine:
                      f"or add funds.")
             self.state.errors.append(f"preflight {sym}: {msg}")
             return {"ok": False, "reason": msg, "hint": "20003 Insufficient balance"}
+        # MARGIN_AMOUNT_PCT: the margin this ONE order locks may not exceed the
+        # configured share of the spendable balance. Sizing already clamps to
+        # it, so this only fires when something downstream (an ORDER_UNIT
+        # re-derivation, a min-volume floor) pushed the size back up - and then
+        # refusing with the number is better than silently exceeding the limit
+        # the user set. It is a budget error, not a balance error, so it does
+        # NOT carry the 20003 hint.
+        if self.state.margin_amount_pct > 0:
+            budget = margin_budget(equity, self.state.margin_amount_pct,
+                                   self.s.margin_safety_pct)
+            if margin_real > budget:
+                msg = (f"margin {margin_real:.4f} USDT for {sym} exceeds the "
+                       f"MARGIN_AMOUNT_PCT={self.state.margin_amount_pct:g}% "
+                       f"budget of {budget:.4f} USDT (available {equity:.4f} "
+                       f"USDT, qty={qty}, notional={notional_real:.4f} at "
+                       f"{self.state.leverage}x). Raise MARGIN_AMOUNT_PCT, "
+                       f"lower the leverage, or add funds.")
+                self.state.errors.append(f"preflight {sym}: {msg}")
+                return {"ok": False, "reason": msg}
         if self.s.min_margin_usdt and margin_real < self.s.min_margin_usdt:
             msg = (f"required margin {margin_real:.4f} USDT is below the configured "
                    f"MIN_MARGIN_USDT={self.s.min_margin_usdt} for {sym} "
@@ -1700,7 +1788,8 @@ class TraderEngine:
             f"report_on={s.report_on} mid_management={s.mid_management}",
             f"symbols={','.join(s.symbols)} leverage={s.leverage}x "
             f"margin={s.margin_mode} position={s.position_mode} max_open={s.max_open_positions}",
-            f"risk_pct={s.risk_pct}% breakeven_pct={s.breakeven_pct}% "
+            f"risk_pct={s.risk_pct}% margin_amount_pct={s.margin_amount_pct:g}% "
+            f"breakeven_pct={s.breakeven_pct}% "
             f"trailing_trigger_roi={s.trailing_trigger_roi_pct}% "
             f"liq_sl_distance={s.liq_sl_distance_pct}%",
             f"min_agreeing={s.min_agreeing} timeframes={','.join(s.timeframes)} "
@@ -1726,6 +1815,7 @@ class TraderEngine:
         "trailing trigger", "liq sl distance", "min agreeing", "timeframes",
         "min confidence", "tf min confidence", "positions history", "close position",
         "margin mode", "position mode", "symbols", "symbol ", "max open positions",
+        "margin amount",
         "leverage", "risk ",
         # the four documented TP/SL methods
         "tpsl method", "partial close pct", "partial at roi",
@@ -1771,6 +1861,7 @@ class TraderEngine:
         "liq sl distance", "min agreeing", "min confidence",
         "tf min confidence", "partial close pct", "partial at roi",
         "account tp usdt", "account sl usdt", "account tp pct", "account sl pct",
+        "margin amount",
     )
 
     def _is_command_argument(self, prefix: str, rest: str) -> bool:
@@ -1954,6 +2045,13 @@ class TraderEngine:
         if low.startswith("close position"):
             sym = arg("close position").strip() or None
             return json.dumps(await self.close_position(symbol=sym), indent=2)
+        if low.startswith("margin amount"):
+            try:
+                s.margin_amount_pct = float(arg("margin amount").split()[-1])
+                return (f"Margin per trade = {s.margin_amount_pct:g}% of the "
+                        f"available balance (0 disables the budget).")
+            except (ValueError, IndexError):
+                return "Usage: margin amount 10"
         if low.startswith("margin mode"):
             val = arg("margin mode").replace(":", "").strip().upper()
             if val in ("ISOLATION", "CROSS"):

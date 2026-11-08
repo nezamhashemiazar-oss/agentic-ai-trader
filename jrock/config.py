@@ -82,6 +82,19 @@ class Settings:
     #: (1 tick = 10^-quotePrecision). Prevents rounding from collapsing a stop
     #: onto the mark price, which the exchange rejects with 30029/30031.
     tpsl_min_stop_ticks: int = 3
+    #: When the configured leverage leaves no room for a stop-loss between the
+    #: liquidation price and the mark price, clamp the leverage for that order
+    #: to the highest value that still fits instead of refusing the trade.
+    #:
+    #: A stop must sit strictly between the liquidation price and the mark. The
+    #: liquidation price is derived from the ENTRY, and a MARKET order fills at
+    #: the last price, which can be on the far side of the mark. At 100x with a
+    #: 0.5% maintenance margin the liquidation price is only ~0.5% below the
+    #: entry, so a mark 1.3% below the last price puts the liquidation price
+    #: ABOVE the mark - no stop can exist, and the engine refused the symbol on
+    #: every scan forever. With this on, the order is placed at the highest
+    #: leverage that still leaves room for a stop.
+    leverage_auto_reduce: bool = True
     #: Which price the exchange compares a TP/SL trigger against.
     #:   MARK_PRICE - the exchange mark price (Bitunix default, and what the
     #:                engine has always sent)
@@ -106,6 +119,22 @@ class Settings:
     min_margin_usdt: float = 0.0
     max_margin_usdt: float = 0.0
     max_notional_usdt: float = 0.0
+    #: How much of the SPENDABLE balance one position may lock as margin, in
+    #: percent. This is the user-facing size knob: "use at most this share of my
+    #: available balance per trade". 10 = a single position may lock 10% of the
+    #: available balance as margin, so ten positions could be open at once.
+    #:
+    #: It is a MARGIN budget, not a notional budget, because margin is what the
+    #: exchange actually deducts from `available` - so the number set here is
+    #: the number the user sees leave their balance. The notional it implies is
+    #: `margin * leverage`, minus the taker fee.
+    #:
+    #: It composes with the balance cap by taking the MINIMUM of the two
+    #: notionals, so it can only ever make an order smaller; it can never talk
+    #: the engine into an order the balance cannot pay for. 0 disables it and
+    #: restores the pre-existing behaviour (size purely by risk_pct, capped by
+    #: the whole spendable balance).
+    margin_amount_pct: float = 10.0
     #: Taker fee rate charged on a MARKET order, as a fraction of notional.
     #: Bitunix USDT-M futures VIP 0 is 0.0006 (0.06%). The engine must reserve
     #: this on top of the initial margin, because the exchange deducts both from
@@ -214,11 +243,13 @@ def load_settings(env_file: str | os.PathLike | None = None) -> Settings:
         kline_max_age_mult=_f("KLINE_MAX_AGE_SEC", 2.0),
         kline_cache_max=_i("KLINE_CACHE_MAX", 500),
         tpsl_min_stop_ticks=_i("TP_SL_MIN_STOP_TICKS", 3),
+        leverage_auto_reduce=_b("LEVERAGE_AUTO_REDUCE", True),
         tp_sl_trigger_type=_tp_sl_trigger_type(),
         order_unit=_order_unit(),
         min_margin_usdt=_f("MIN_MARGIN_USDT", 0.0),
         max_margin_usdt=_f("MAX_MARGIN_USDT", 0.0),
         max_notional_usdt=_f("MAX_NOTIONAL_USDT", 0.0),
+        margin_amount_pct=_f("MARGIN_AMOUNT_PCT", 10.0),
         taker_fee_rate=_f("TAKER_FEE_RATE", 0.0006),
         margin_safety_pct=_f("MARGIN_SAFETY_PCT", 2.0),
         max_memory_items=_i("MAX_MEMORY_ITEMS", 5000),
