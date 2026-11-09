@@ -278,11 +278,27 @@ def test_engine_places_a_smaller_order_at_a_lower_percentage():
     assert margin_required(qty1 * 0.005009, e1.state.leverage) <= budget1
 
 
-def test_engine_budget_stops_biting_once_risk_size_is_smaller():
-    """Above the crossover the risk-based size wins, so the order is unchanged."""
+def test_engine_budget_is_a_target_not_a_cap():
+    """The percentage is the SIZING AUTHORITY, so a bigger percentage is a
+    bigger order.
+
+    This used to assert the opposite - that 10% and 30% produced the same qty
+    because the risk-based size was the smaller of the two and the "cap" never
+    bound. That is precisely the bug the user reported: a setting that never
+    changes anything is indistinguishable from a setting that is ignored.
+    """
     _, e10 = _run(margin_pct=10.0)
     _, e30 = _run(margin_pct=30.0)
-    assert float(e10.client.placed[0]["qty"]) == float(e30.client.placed[0]["qty"])
+    qty10 = float(e10.client.placed[0]["qty"])
+    qty30 = float(e30.client.placed[0]["qty"])
+    assert qty30 > qty10
+    # and each one's margin lands on its own target
+    for pct, e in ((10.0, e10), (30.0, e30)):
+        qty = float(e.client.placed[0]["qty"])
+        target = 1000.0 * pct / 100.0
+        locked = margin_required(qty * 0.005009, e.state.leverage)
+        assert locked <= target + 1e-9
+        assert locked >= target * 0.95
 
 
 def test_engine_state_carries_the_setting():

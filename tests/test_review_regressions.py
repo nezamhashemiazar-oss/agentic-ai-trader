@@ -107,10 +107,12 @@ def test_pick_tier_is_imported_in_engine():
 
 
 def test_preflight_does_not_raise_nameerror_above_every_tier():
-    """BUG-1 end to end: leverage above every tier cap must be REFUSED, not crash.
+    """BUG-1 end to end: leverage above every tier cap must not crash.
 
     Before the fix this raised `NameError: name 'pick_tier' is not defined`
-    instead of returning a clean refusal.
+    instead of returning a clean answer. The exchange's own maximum is the one
+    documented reason to use a lower leverage, so the order now goes out at
+    that cap and the reason is recorded - and the user's setting is untouched.
     """
     e = _engine(leverage=200)
 
@@ -119,9 +121,10 @@ def test_preflight_does_not_raise_nameerror_above_every_tier():
         return await e.try_enter(Agg())
 
     r = asyncio.run(go())
-    assert r["ok"] is False
-    assert "above the maximum" in r["reason"]
-    assert e.client.placed == [], "no order may be sent"
+    assert r["ok"] is True, r.get("reason")
+    assert len(e.client.placed) == 1
+    assert e.state.leverage == 200, "the user's leverage setting must not be rewritten"
+    assert any("exchange maximum" in err for err in e.state.errors), e.state.errors
 
 
 # --------------------------------------------------------------------- BUG-2

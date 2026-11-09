@@ -71,7 +71,7 @@ class Agg:
     agreeing = 4
 
 
-def _run(equity, mark, last, leverage):
+def _run_engine(equity, mark, last, leverage):
     s = Settings()
     s.market_data_source = "rest"
     e = TraderEngine(s)
@@ -82,28 +82,34 @@ def _run(equity, mark, last, leverage):
         await e.load_rules(["AKEUSDT"])
         return await e.try_enter(Agg())
 
-    return asyncio.run(go()), e.client.placed
+    return asyncio.run(go()), e
 
 
-def test_tier_leverage_cap_refuses_before_sending():
+def _run(equity, mark, last, leverage):
+    r, e = _run_engine(equity, mark, last, leverage)
+    return r, e.client.placed
+
+
+def test_tier_leverage_cap_lowers_leverage_and_continues():
     """A REAL order notional that lands in a tier forbidding the leverage is
-    refused locally, with no order sent.
+    re-sized at the exchange's own tier cap and sent - not refused.
 
     equity 100k, risk 1%, 50x -> the risk-sized notional is ~400k, which lands
-    in the last tier (max 20x), so 50x is genuinely not allowed for it.
+    in the last tier (max 20x). The exchange's cap is the one documented reason
+    to use a lower leverage, so the order goes out at 20x and the reason is
+    reported. The user's setting is NOT rewritten.
     """
     r, placed = _run(100000.0, 0.005020, 0.005009, 50)
-    assert r["ok"] is False
-    assert placed == [], "no order may be sent when the tier forbids the leverage"
-    assert "exceeds the maximum" in r["reason"]
-    assert "20x" in r["reason"]
-    assert r["hint"] == "20003 Insufficient balance"
+    assert r["ok"] is True, r.get("reason")
+    assert len(placed) == 1
 
 
-def test_tier_leverage_cap_names_both_margins():
-    r, _ = _run(100000.0, 0.005020, 0.005009, 50)
-    assert "19265.3844" in r["reason"]   # what the exchange would require at 20x
-    assert "7706.1538" in r["reason"]    # what we computed at 50x
+def test_tier_leverage_cap_is_reported_to_the_user():
+    """The clamp must be visible, not silent: the engine records why."""
+    _, e = _run_engine(100000.0, 0.005020, 0.005009, 50)
+    assert any("tier cap" in err for err in e.state.errors), e.state.errors
+    # and the user's leverage setting is untouched
+    assert e.state.leverage == 50
 
 
 def test_valid_high_leverage_order_is_not_refused():

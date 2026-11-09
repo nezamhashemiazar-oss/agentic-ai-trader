@@ -347,6 +347,9 @@ class JRockAgent:
         # A destructive natural-language action waiting for a yes/no. Held in
         # memory only: a pending order confirmation must not survive a restart.
         self._pending_action: nlu.Intent | None = None
+        #: Recent free-text turns, replayed to the model so a follow-up has a
+        #: referent. In memory only - a conversation is not durable state.
+        self._history: list[tuple[str, str]] = []
         self._load_registry()
 
     # ---------------------------------------------------------- persistence
@@ -870,6 +873,89 @@ class JRockAgent:
         except Exception as e:  # noqa: BLE001
             return 0, f"{type(e).__name__}: {e}", None
 
+    #: How many past turns are replayed to the model. Enough for a real
+    #: conversation ("what about the other one?", "and my leverage?") without
+    #: letting the prompt grow without bound.
+    HISTORY_TURNS = 12
+
+    def _system_prompt(self) -> str:
+        """The system prompt: the soul file, plus how to actually converse.
+
+        Two defects made the agent feel like a command parser rather than
+        something you can talk to:
+
+        1. **The soul was never sent.** `soul/jrock.soul.md` is the persona -
+           voice, honesty rules, trading discipline - and `chat()` built a
+           three-sentence prompt from scratch instead of using it. The model
+           never saw the persona the project is built around.
+        2. **Every message was a fresh single-turn call.** No history was
+           replayed, so a follow-up like "and my leverage?" had no referent and
+           the model could only answer in isolation - which reads as robotic
+           even when the wording is fine.
+
+        The prompt below fixes both, and states the conversational contract
+        explicitly: understand intent from ordinary sentences (Persian and
+        English), ask when the request is ambiguous, and confirm before
+        anything that moves money.
+        """
+        soul = self.soul()
+        if soul.startswith("(no soul file)"):
+            soul = ""
+        parts = [soul.strip()] if soul.strip() else []
+        parts.append(
+            "## How you talk\n"
+            "You are a conversational partner, not a command parser. The user "
+            "may write in English or Persian (Farsi), formally or casually, and "
+            "may not use any command syntax at all.\n"
+            "\n"
+            "- Read the INTENT, not the keywords. \"how much margin am I using?\" "
+            "and \"مارجینم چقدره؟\" both mean: report the margin setting. "
+            "\"close my position\" / \"پوزیشنم رو ببند\" both mean: close it. "
+            "\"nudge my risk up a bit\" / \"یه کم ریسک رو ببر بالا\" both mean: "
+            "raise risk_pct - ask for the number if it is not stated.\n"
+            "- Answer in the language the user wrote in. Match their register: "
+            "casual in, casual out. Do not answer a friendly question with a "
+            "table of commands.\n"
+            "- If the request is ambiguous, ask ONE short clarifying question "
+            "with the concrete options. Never guess about money.\n"
+            "- Before anything that opens or closes a position, or changes "
+            "leverage, risk, margin, autotrade or the engine, say what you are "
+            "about to do and wait for an explicit yes.\n"
+            "- You have a real Bitunix futures engine. When a question is about "
+            "the account, positions, orders, prices or settings, the engine's "
+            "own answer is the truth - never invent a number. If you do not "
+            "have the value, say so and name the command that would get it.\n"
+            "- Be brief and warm. No filler praise, no walls of text, no "
+            "restating the question back at them.\n"
+            "\n"
+            "## What you can do\n"
+            "Commands exist and the user can type them, but they never have to. "
+            "The full list is in /help. Deterministic commands are handled "
+            "before you are ever called, so if a message reached you it is "
+            "genuinely conversational - answer it as such."
+        )
+        return "\n\n".join(parts)
+
+    def _history_messages(self) -> list[dict]:
+        """The recent conversation, as chat messages.
+
+        Only free-text turns are kept: a command's output is already in the
+        transcript the user can see, and replaying large engine dumps would
+        crowd out the actual conversation.
+        """
+        out: list[dict] = []
+        for role, content in self._history[-self.HISTORY_TURNS:]:
+            out.append({"role": role, "content": content})
+        return out
+
+    def _remember_turn(self, user_text: str, reply: str) -> None:
+        """Record one exchange so the next message has a referent."""
+        self._history.append(("user", user_text))
+        self._history.append(("assistant", reply))
+        # Keep the buffer bounded; a long session must not grow forever.
+        if len(self._history) > self.HISTORY_TURNS * 4:
+            del self._history[: len(self._history) - self.HISTORY_TURNS * 2]
+
     async def chat(self, text: str) -> str:
         """Send free text to the configured model.
 
@@ -893,17 +979,16 @@ class JRockAgent:
             model = res.selected
             self.model = model
 
-        system = ("You are J+Rock, an agentic coding and trading-systems engineer. "
-                  "Be direct, never fabricate results, say 'I don't know' when unsure. "
-                  "You have a Bitunix futures engine; its commands are listed in /help.")
+        system = self._system_prompt()
         level = self.thinking_level
         max_tokens = self._max_tokens_for(level)
         reasoning = self.reasoning_params(model)
 
         payload = {
             "model": model,
-            "messages": [{"role": "system", "content": system},
-                         {"role": "user", "content": text}],
+            "messages": ([{"role": "system", "content": system}]
+                         + self._history_messages()
+                         + [{"role": "user", "content": text}]),
             "max_tokens": max_tokens,
             "temperature": 0.2,
         }
@@ -926,6 +1011,7 @@ class JRockAgent:
         if not verdict.is_empty:
             out = parsed["choices"][0]["message"]["content"].strip()
             self.memory.episode("chat", text[:120], out[:120], ok=True)
+            self._remember_turn(text, out)
             return out
 
         # ---- empty response: log everything needed to diagnose it
@@ -947,6 +1033,7 @@ class JRockAgent:
                 if not v2.is_empty:
                     out = parsed2["choices"][0]["message"]["content"].strip()
                     self.memory.episode("chat", text[:120], out[:120], ok=True)
+                    self._remember_turn(text, out)
                     return (f"[retried with thinking=off after an empty response at "
                             f"level {level}]\n\n{out}")
             log.warning("chat: retry with thinking=off also failed: %s", body2[:400])

@@ -39,6 +39,7 @@ from .risk import (PairRules, Tier, TpSlSideError, clamp_sl, clamp_tp,
                    max_leverage_for_stop, max_notional_for_balance,
                    max_notional_for_margin,
                    pick_tier,
+                   position_size_by_margin,
                    position_size_by_risk,
                    qty_from_notional, qty_from_unit, required_cost, roi_pct,
                    round_price, round_step, spendable_balance,
@@ -811,7 +812,22 @@ class TraderEngine:
         # for a SHORT. Solving the liquidation formula for L gives the highest
         # leverage at which a stop still fits.
         worst_entry = max(price, mark) if side == "LONG" else min(price, mark)
-        lev_tier = tier_for_leverage(tiers, self.state.leverage) or pick_tier(tiers, 0.0)
+
+        # --- leverage for THIS order, resolved locally.
+        #
+        # `self.state.leverage` is the user's setting and is NEVER written here.
+        # It used to be mutated in place when a stop did not fit, which meant a
+        # single awkward symbol silently rewrote the leverage for every other
+        # symbol and every later scan - and, worse, made a margin problem look
+        # like it had been "fixed" by lowering leverage. Leverage and margin are
+        # independent knobs: margin decides how much of the balance one position
+        # locks, leverage only decides how much notional that margin controls.
+        # The ONLY reasons to use a different leverage for one order are the two
+        # the exchange itself imposes: no room for a stop, or a tier cap.
+        leverage = int(self.state.leverage)
+        lev_notes: list[str] = []
+
+        lev_tier = tier_for_leverage(tiers, leverage) or pick_tier(tiers, 0.0)
         max_lev_for_stop = max_leverage_for_stop(
             entry=worst_entry, mark=mark, side=side,
             maintenance_margin_rate=lev_tier.maintenance_margin_rate,
@@ -826,7 +842,7 @@ class TraderEngine:
             self.state.errors.append(f"preflight {sym}: {msg}")
             return {"ok": False, "reason": msg}
 
-        if self.state.leverage > max_lev_for_stop:
+        if leverage > max_lev_for_stop:
             if self.s.leverage_auto_reduce:
                 # Clamp to the highest leverage that still leaves room for a
                 # stop. This is the difference between "the bot never trades
@@ -834,21 +850,21 @@ class TraderEngine:
                 log.warning(
                     "%s: leverage %dx leaves no room for a stop-loss between "
                     "the liquidation price and the mark %s (entry %s) - "
-                    "reducing to %dx for this order",
-                    sym, self.state.leverage, mark, price, max_lev_for_stop)
-                self.state.errors.append(
-                    f"leverage {sym}: {self.state.leverage}x leaves no room for "
-                    f"a stop-loss (mark {mark:.{rules.quote_precision}f}, entry "
+                    "using %dx for this order (the setting is unchanged)",
+                    sym, leverage, mark, price, max_lev_for_stop)
+                lev_notes.append(
+                    f"leverage {sym}: {leverage}x leaves no room for a "
+                    f"stop-loss (mark {mark:.{rules.quote_precision}f}, entry "
                     f"{price:.{rules.quote_precision}f}); using "
                     f"{max_lev_for_stop}x for this order")
-                self.state.leverage = max_lev_for_stop
+                leverage = max_lev_for_stop
             else:
-                msg = (f"leverage {self.state.leverage}x leaves no room for a "
+                msg = (f"leverage {leverage}x leaves no room for a "
                        f"stop-loss on {sym}: the stop must sit between the "
                        f"liquidation price and the mark "
                        f"{mark:.{rules.quote_precision}f} (entry "
                        f"{price:.{rules.quote_precision}f}), and at "
-                       f"{self.state.leverage}x the liquidation price is already "
+                       f"{leverage}x the liquidation price is already "
                        f"past the mark. The highest leverage that still fits is "
                        f"{max_lev_for_stop}x. Lower the leverage, or set "
                        f"LEVERAGE_AUTO_REDUCE=true to let the engine clamp it.")
@@ -861,7 +877,7 @@ class TraderEngine:
         # (`equity * leverage` ignored the fee and over-stated the bound, which
         # also pushed the tier selection into a higher band than the real order.)
         max_notional = max_notional_for_balance(
-            equity, self.state.leverage, self.s.taker_fee_rate,
+            equity, leverage, self.s.taker_fee_rate,
             self.s.margin_safety_pct)
 
         # Provisional plan: only the stop-loss is needed here, to size the
@@ -871,21 +887,32 @@ class TraderEngine:
         # formula degenerate (liq on the wrong side of entry), which would
         # raise TpSlSideError for an order that is actually fine. The tier the
         # REAL order notional lands in is checked after sizing.
-        prov_tier = tier_for_leverage(tiers, self.state.leverage)
+        prov_tier = tier_for_leverage(tiers, leverage)
         if prov_tier is None:
+            # The exchange caps leverage below the setting at EVERY size. That
+            # is the one documented reason to lower it, so lower it to the
+            # exchange's own maximum and carry on - refusing here would leave
+            # the user with a symbol that can never trade.
             max_lev = max((t.leverage for t in tiers), default=0)
-            msg = (f"leverage {self.state.leverage}x is above the maximum "
-                   f"{max_lev}x allowed for {sym} at any position size. "
-                   f"Lower the leverage.")
-            self.state.errors.append(f"preflight {sym}: {msg}")
-            return {"ok": False, "reason": msg, "hint": "20003 Insufficient balance"}
+            if max_lev <= 0:
+                msg = (f"leverage {leverage}x is above the maximum allowed for "
+                       f"{sym} at any position size, and the exchange reported "
+                       f"no usable tier. Lower the leverage.")
+                self.state.errors.append(f"preflight {sym}: {msg}")
+                return {"ok": False, "reason": msg}
+            lev_notes.append(
+                f"leverage {sym}: {leverage}x is above the exchange maximum "
+                f"{max_lev}x for this symbol; using {max_lev}x for this order")
+            leverage = max_lev
+            prov_tier = tier_for_leverage(tiers, leverage) or pick_tier(tiers, 0.0)
+
         prov_notional = max_notional
         if prov_tier.end_value != float("inf") and prov_tier.end_value > 0:
             prov_notional = min(max_notional, prov_tier.end_value * 0.9999)
 
         try:
             plan = plan_tpsl(
-                side=side, entry=price, leverage=self.state.leverage,
+                side=side, entry=price, leverage=leverage,
                 notional=prov_notional,
                 strength=agg.strength, confidence=agg.confidence, tiers=tiers, rules=rules,
                 liq_sl_distance_pct=self.state.liq_sl_distance_pct,
@@ -897,11 +924,40 @@ class TraderEngine:
             self.state.errors.append(f"tpsl {sym}: {e}")
             return {"ok": False, "reason": f"cannot place a valid stop-loss: {e}"}
 
-        qty = position_size_by_risk(equity, self.state.risk_pct, price, plan.sl,
-                                    self.state.leverage, rules,
-                                    fee_rate=self.s.taker_fee_rate,
-                                    safety_pct=self.s.margin_safety_pct,
-                                    margin_pct=self.state.margin_amount_pct)
+        # --- sizing.
+        #
+        # MARGIN_AMOUNT_PCT is the SIZING AUTHORITY when it is set: "use this
+        # share of my balance as margin on this position". It used to be passed
+        # to position_size_by_risk as an upper bound, and because the risk-based
+        # size was almost always the smaller of the two the cap never bound - so
+        # the margin actually locked was whatever risk sizing produced (a 10%
+        # setting produced ~2% of the balance) and the setting looked like it
+        # did nothing. Sizing FROM the percentage is what makes the number the
+        # user set the number they see on the position.
+        #
+        # risk_pct is the fallback for when the knob is 0 (disabled), not a
+        # silent override of it. The risk implied at the stop is reported so the
+        # user can see what the margin target actually costs them.
+        if self.state.margin_amount_pct > 0:
+            qty = position_size_by_margin(
+                equity, self.state.margin_amount_pct, price, leverage, rules,
+                fee_rate=self.s.taker_fee_rate,
+                safety_pct=self.s.margin_safety_pct)
+            if qty > 0 and plan.sl > 0:
+                implied_risk = abs(price - plan.sl) * qty
+                lev_notes.append(
+                    f"size {sym}: MARGIN_AMOUNT_PCT={self.state.margin_amount_pct:g}% "
+                    f"-> qty {qty} (notional {qty * price:.4f} USDT, margin "
+                    f"{margin_required(qty * price, leverage):.4f} USDT at "
+                    f"{leverage}x); risk at the stop is {implied_risk:.4f} USDT "
+                    f"({implied_risk / equity * 100:.2f}% of balance, "
+                    f"risk_pct={self.state.risk_pct:g}% is not applied while "
+                    f"the margin target is set)")
+        else:
+            qty = position_size_by_risk(
+                equity, self.state.risk_pct, price, plan.sl, leverage, rules,
+                fee_rate=self.s.taker_fee_rate,
+                safety_pct=self.s.margin_safety_pct)
         if qty <= 0:
             return {"ok": False, "reason": "computed qty is 0 (risk too small or below min volume)"}
 
@@ -912,8 +968,8 @@ class TraderEngine:
         order_unit = (self.s.order_unit or "QUANTITY").upper()
         if order_unit != "QUANTITY":
             sized_notional = qty * price
-            amount = unit_from_qty(qty, order_unit, price, self.state.leverage)
-            qty = qty_from_unit(amount, order_unit, price, self.state.leverage, rules)
+            amount = unit_from_qty(qty, order_unit, price, leverage)
+            qty = qty_from_unit(amount, order_unit, price, leverage, rules)
             if qty <= 0:
                 return {"ok": False,
                         "reason": f"computed qty is 0 in {order_unit} units "
@@ -927,13 +983,64 @@ class TraderEngine:
         # The tier the REAL order notional lands in caps the leverage. Checked
         # against the actual notional, not `equity * leverage` (which lands in a
         # higher tier and produced a bogus 20003 for an order that was fine).
-        tier_msg = tier_leverage_violation(tiers, notional_real, self.state.leverage)
-        if tier_msg:
-            msg = f"{sym}: {tier_msg}"
+        #
+        # When the tier does cap it, the exchange's own maximum is the answer:
+        # lower the leverage to that cap, re-size and re-plan, and say so. The
+        # loop is bounded because each pass can only lower the leverage, and a
+        # lower leverage at a fixed margin budget means a smaller notional,
+        # which lands in a tier that permits at least as much leverage.
+        for _ in range(3):
+            tier_msg = tier_leverage_violation(tiers, notional_real, leverage)
+            if not tier_msg:
+                break
+            cap = pick_tier(tiers, notional_real).leverage
+            if cap <= 0 or cap >= leverage:
+                msg = f"{sym}: {tier_msg}"
+                self.state.errors.append(f"preflight {sym}: {msg}")
+                return {"ok": False, "reason": msg, "hint": "20003 Insufficient balance"}
+            lev_notes.append(
+                f"leverage {sym}: {leverage}x exceeds the exchange tier cap "
+                f"{cap}x for a {notional_real:.2f} USDT position; using {cap}x "
+                f"for this order")
+            leverage = cap
+            if self.state.margin_amount_pct > 0:
+                qty = position_size_by_margin(
+                    equity, self.state.margin_amount_pct, price, leverage, rules,
+                    fee_rate=self.s.taker_fee_rate,
+                    safety_pct=self.s.margin_safety_pct)
+            else:
+                qty = position_size_by_risk(
+                    equity, self.state.risk_pct, price, plan.sl, leverage, rules,
+                    fee_rate=self.s.taker_fee_rate,
+                    safety_pct=self.s.margin_safety_pct)
+            if qty <= 0:
+                return {"ok": False,
+                        "reason": "computed qty is 0 after the exchange tier "
+                                  "capped the leverage"}
+            notional_real = qty * price
+            try:
+                plan = plan_tpsl(
+                    side=side, entry=price, leverage=leverage,
+                    notional=notional_real, strength=agg.strength,
+                    confidence=agg.confidence, tiers=tiers, rules=rules,
+                    liq_sl_distance_pct=self.state.liq_sl_distance_pct,
+                    breakeven_pct=self.state.breakeven_pct,
+                    trailing_trigger_roi_pct=self.state.trailing_trigger_roi_pct,
+                    mark=mark, min_stop_ticks=self.s.tpsl_min_stop_ticks,
+                )
+            except TpSlSideError as e:
+                self.state.errors.append(f"tpsl {sym}: {e}")
+                return {"ok": False, "reason": f"cannot place a valid stop-loss: {e}"}
+        else:
+            msg = (f"{sym}: the exchange tier cap could not be satisfied at any "
+                   f"leverage for a {notional_real:.2f} USDT position.")
             self.state.errors.append(f"preflight {sym}: {msg}")
             return {"ok": False, "reason": msg, "hint": "20003 Insufficient balance"}
 
-        margin_real = margin_required(notional_real, self.state.leverage)
+        for note in lev_notes:
+            self.state.errors.append(note)
+
+        margin_real = margin_required(notional_real, leverage)
         # Opening a MARKET order costs the initial margin AND a taker fee, and
         # the exchange deducts BOTH from the available balance at once. Checking
         # only the margin let `margin == equity` pass locally and then fail on
@@ -952,29 +1059,44 @@ class TraderEngine:
                       f"MARGIN_SAFETY_PCT={self.s.margin_safety_pct:g}%)"
                       if self.s.margin_safety_pct else "")
                    + f" for qty={qty}, notional={notional_real:.4f} at "
-                     f"{self.state.leverage}x. Lower the leverage, lower risk_pct, "
+                     f"{leverage}x. Lower the leverage, lower risk_pct, "
                      f"or add funds.")
             self.state.errors.append(f"preflight {sym}: {msg}")
             return {"ok": False, "reason": msg, "hint": "20003 Insufficient balance"}
         # MARGIN_AMOUNT_PCT: the margin this ONE order locks may not exceed the
-        # configured share of the spendable balance. Sizing already clamps to
-        # it, so this only fires when something downstream (an ORDER_UNIT
-        # re-derivation, a min-volume floor) pushed the size back up - and then
-        # refusing with the number is better than silently exceeding the limit
-        # the user set. It is a budget error, not a balance error, so it does
-        # NOT carry the 20003 hint.
+        # configured share of the spendable balance. Sizing already targets it,
+        # so this only fires when something downstream (an ORDER_UNIT
+        # re-derivation, a min-volume floor) pushed the size back up. The
+        # correct response is to CLAMP the size to the budget and say so - not
+        # to refuse, and never to touch the leverage, which has nothing to do
+        # with how much of the balance one position may lock.
         if self.state.margin_amount_pct > 0:
             budget = margin_budget(equity, self.state.margin_amount_pct,
                                    self.s.margin_safety_pct)
             if margin_real > budget:
-                msg = (f"margin {margin_real:.4f} USDT for {sym} exceeds the "
-                       f"MARGIN_AMOUNT_PCT={self.state.margin_amount_pct:g}% "
-                       f"budget of {budget:.4f} USDT (available {equity:.4f} "
-                       f"USDT, qty={qty}, notional={notional_real:.4f} at "
-                       f"{self.state.leverage}x). Raise MARGIN_AMOUNT_PCT, "
-                       f"lower the leverage, or add funds.")
-                self.state.errors.append(f"preflight {sym}: {msg}")
-                return {"ok": False, "reason": msg}
+                max_notional_budget = max_notional_for_margin(
+                    budget, leverage, self.s.taker_fee_rate)
+                clamped = round_step(max_notional_budget / price, rules.base_precision)
+                if clamped < rules.min_trade_volume:
+                    msg = (f"margin {margin_real:.4f} USDT for {sym} exceeds the "
+                           f"MARGIN_AMOUNT_PCT={self.state.margin_amount_pct:g}% "
+                           f"budget of {budget:.4f} USDT, and clamping to the "
+                           f"budget leaves {clamped} below the symbol's minimum "
+                           f"volume {rules.min_trade_volume}. Raise "
+                           f"MARGIN_AMOUNT_PCT or add funds.")
+                    self.state.errors.append(f"preflight {sym}: {msg}")
+                    return {"ok": False, "reason": msg}
+                self.state.errors.append(
+                    f"margin {sym}: qty {qty} would lock {margin_real:.4f} USDT, "
+                    f"above the MARGIN_AMOUNT_PCT={self.state.margin_amount_pct:g}% "
+                    f"budget of {budget:.4f} USDT; clamped to qty {clamped} "
+                    f"(notional {clamped * price:.4f} USDT). Leverage is "
+                    f"unchanged at {leverage}x.")
+                qty = clamped
+                notional_real = qty * price
+                margin_real = margin_required(notional_real, leverage)
+                fee_real = fee_for_notional(notional_real, self.s.taker_fee_rate)
+                required_real = margin_real + fee_real
         if self.s.min_margin_usdt and margin_real < self.s.min_margin_usdt:
             msg = (f"required margin {margin_real:.4f} USDT is below the configured "
                    f"MIN_MARGIN_USDT={self.s.min_margin_usdt} for {sym} "
@@ -997,7 +1119,7 @@ class TraderEngine:
         # re-plan with the real notional
         try:
             plan = plan_tpsl(
-                side=side, entry=price, leverage=self.state.leverage,
+                side=side, entry=price, leverage=leverage,
                 notional=qty * price, strength=agg.strength, confidence=agg.confidence,
                 tiers=tiers, rules=rules,
                 liq_sl_distance_pct=self.state.liq_sl_distance_pct,
@@ -1016,7 +1138,7 @@ class TraderEngine:
             if e.code not in (20006, 20009):
                 self.state.errors.append(f"margin_mode {sym}: {e}")
         try:
-            await self.client.change_leverage(sym, self.state.leverage)
+            await self.client.change_leverage(sym, leverage)
         except BitunixAPIError as e:
             if e.code not in (20006,):
                 self.state.errors.append(f"leverage {sym}: {e}")

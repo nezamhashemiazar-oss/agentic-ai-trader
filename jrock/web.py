@@ -326,7 +326,13 @@ function render(s) {
     esc(s.readouts[k]) + "</pre>").join("");
 
   const st = document.getElementById("settings");
-  st.innerHTML = (s.settings || []).map(f =>
+  const mp = s.margin_plan || {};
+  st.innerHTML = (mp.enabled === false ? "" :
+    "<div class='row'><label>margin per position</label><b>" +
+    esc(mp.pct) + "% = " + money(mp.target_usdt) + " USDT</b></div>" +
+    "<div class='row'><label>margin basis</label><span>" +
+    esc(mp.note) + "</span></div>") +
+    (s.settings || []).map(f =>
     "<div class='row'><label>" + esc(f.label) + "</label>" +
     "<input id='set_" + f.key + "' value='" + esc(f.value) + "'>" +
     "<button data-set='" + f.key + "'>set</button></div>").join("") +
@@ -596,6 +602,42 @@ def _setting_fields(agent: JRockAgent) -> list[dict]:
     return [{"key": k, "label": lab, "value": v} for k, lab, v in fields]
 
 
+def _margin_plan(s, account: dict) -> dict:
+    """What MARGIN_AMOUNT_PCT actually means right now, in USDT.
+
+    The setting is a percentage, and a percentage of what is not obvious from
+    the number alone - the user's complaint was that the margin on a real
+    position did not match the percentage they set. Showing the derived USDT
+    amount next to the percentage makes the two directly comparable, and makes
+    a clamp visible instead of silent.
+
+    ``target_usdt`` is the margin one position will aim to lock. It is derived
+    from the spendable balance (``available``), which is what the engine sizes
+    from - not equity, which includes unrealized PnL that cannot be spent.
+    """
+    pct = float(getattr(s, "margin_amount_pct", 0.0) or 0.0)
+    available = float(account.get("available") or 0.0)
+    equity = float(account.get("equity") or 0.0)
+    target = available * pct / 100.0 if pct > 0 else 0.0
+    return {
+        "pct": pct,
+        "basis": "available",
+        "available": round(available, 4),
+        "equity": round(equity, 4),
+        "target_usdt": round(target, 4),
+        "leverage": int(getattr(s, "leverage", 0) or 0),
+        # margin * leverage = the notional the target margin controls. Shown so
+        # the user can see that leverage changes the SIZE, not the margin.
+        "target_notional": round(target * int(getattr(s, "leverage", 0) or 0), 4),
+        "enabled": pct > 0,
+        "note": ("0 disables the margin target; sizing falls back to risk_pct."
+                 if pct <= 0 else
+                 f"{pct:g}% of the {available:.2f} USDT available balance "
+                 f"= {target:.2f} USDT margin per position at "
+                 f"{int(getattr(s, 'leverage', 0) or 0)}x."),
+    }
+
+
 async def _readouts(agent: JRockAgent) -> dict[str, str]:
     """The read/query commands, surfaced as dashboard readouts.
 
@@ -668,6 +710,7 @@ async def build_state(agent: JRockAgent) -> dict:
         "updated_at": time.strftime("%H:%M:%S"),
         "updated_ts": time.time(),
         "report_interval": REPORT_INTERVAL_SEC,
+        "margin_plan": _margin_plan(s, account),
         "engine": {
             "engine_on": s.engine_on,
             "autotrade": s.autotrade,

@@ -107,6 +107,23 @@ def _num_after(text: str, *anchors: str) -> float | None:
     return None
 
 
+def _first_num(text: str) -> float | None:
+    """The first number anywhere in the text.
+
+    Used as the fallback for the Persian rules: `_num_after` anchors on an
+    English keyword, and a Persian sentence has none. The rule has already
+    matched a Persian phrase naming the setting, so the first number in the
+    sentence is the value - there is nothing else it could be.
+    """
+    m = _NUM_RE.search(text)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
 def _symbols_in(text: str) -> list[str]:
     return _SYMBOL_RE.findall(text.upper())
 
@@ -213,6 +230,8 @@ def _b_leverage_read(t: str) -> Intent:
 def _b_leverage_set(t: str) -> Intent:
     n = _num_after(t, "leverage", "lev", "to", "at")
     if n is None:
+        n = _first_num(t)
+    if n is None:
         return Intent("leverage_set", "", 0.5, needs="leverage value",
                       describe="set leverage")
     return Intent("leverage_set", f"leverage {int(n)}", 0.9, destructive=True,
@@ -221,6 +240,8 @@ def _b_leverage_set(t: str) -> Intent:
 
 def _b_risk_set(t: str) -> Intent:
     n = _num_after(t, "risk", "to", "at")
+    if n is None:
+        n = _first_num(t)
     if n is None:
         return Intent("risk_set", "", 0.5, needs="risk percentage",
                       describe="set risk per trade")
@@ -237,6 +258,11 @@ def _b_margin_amount_set(t: str) -> Intent:
     """
     n = _num_after(t, "margin", "amount", "pct", "percent", "to", "at", "use",
                    "trade", "risk", "size")
+    if n is None:
+        # Persian sentences have no English anchor for _num_after; the rule
+        # already matched a phrase naming the setting, so the first number is
+        # the value.
+        n = _first_num(t)
     if n is None:
         return Intent("margin_amount_set", "", 0.5, needs="margin percentage",
                       describe="set the margin amount per trade")
@@ -401,7 +427,11 @@ def _b_smalltalk(t: str) -> Intent:
 #: "hi", "thanks", "thx" ... and the agent answered nothing at all.
 _SMALLTALK_SINGLE = re.compile(
     r"^\s*(hi|hello|hey|yo|hiya|howdy|thanks|thank you|thx|ty|cheers|"
-    r"good\s+(morning|afternoon|evening))\s*[!.?]*\s*$", re.I)
+    r"good\s+(morning|afternoon|evening)|"
+    # Persian greetings/thanks are single words too, and must get a reply
+    # rather than falling through to nothing.
+    r"سلام|درود|سلام\s*علیکم|چطوری|خوبی|ممنون|مرسی|صبح\s*بخیر|شب\s*بخیر|"
+    r"دستت\s*درد\s*نکنه)\s*[!.?؟]*\s*$", re.I)
 
 
 def _b_risk_read(t: str) -> Intent:
@@ -538,6 +568,11 @@ RULES: list[tuple[str, re.Pattern, object]] = [
         r"\b(show|what|whats|what's|display|print|see|check|get|tell|my|how much)\b"
         r".*\b(margin amount|margin pct|margin percent|margin per trade|"
         r"margin percentage)\b", re.I), _b_margin_amount_read),
+    # "how much margin am i using?" / "what margin am i on?" - the natural
+    # phrasing names "margin" alone, which the rule above does not match.
+    ("margin_amount_read", re.compile(
+        r"\b(how much|what|whats|what's|which)\b.*\bmargin\b"
+        r"(?!\s*(mode|ratio|coin|call))", re.I), _b_margin_amount_read),
 
     # --- autotrade
     ("autotrade_on", re.compile(
@@ -685,6 +720,80 @@ RULES: list[tuple[str, re.Pattern, object]] = [
         r"\b(explain|what is|what'?s|how does|tell me about|what does)\b.*"
         r"\b(taker fee|fee rate|trading fee|margin safety|safety pct|"
         r"min stop ticks|stop ticks|min stop distance)\b", re.I), _b_what_is),
+
+    # --- Persian (Farsi) conversational forms.
+    #
+    # The user writes in Persian as often as English, and none of the rules
+    # above match it - so every Persian sentence fell through to the model,
+    # which has no engine access and answered in generic prose. That is a large
+    # part of why the agent felt like it could not be talked to. These rules
+    # map the common phrasings onto the SAME commands the English rules use;
+    # they add no new handlers.
+    #
+    # Persian is written with ZWNJ (\u200c) inside many compound words, so the
+    # patterns allow it explicitly rather than assuming a space.
+    ("margin_amount_read", re.compile(
+        r"(مارجین|مارجینم|حاشیه\s*نقد|حاشیه\u200cی\s*نقد|مارجین\s*هر\s*معامله)"
+        r".*(چقدر|چند|چیه|چیست|بگو|نشون|نمایش|درصد)"
+        r"|(چقدر|چند)\s*(مارجین|حاشیه\s*نقد)", re.I), _b_margin_amount_read),
+    ("margin_amount_set", re.compile(
+        r"(مارجین|حاشیه\s*نقد|مارجین\s*هر\s*معامله).*"
+        r"(\d+(?:\.\d+)?)\s*(درصد|٪|%)?", re.I), _b_margin_amount_set),
+    ("balance", re.compile(
+        r"(موجودی|بالانس|سرمایه|مانده\s*حساب|چقدر\s*پول)"
+        r".*(چقدر|چند|چیه|چیست|بگو|نشون|نمایش|دارم|هست)"
+        r"|(چقدر|چند)\s*(پول|موجودی|بالانس)\s*(دارم|هست|داری)", re.I), _b_balance),
+    ("positions", re.compile(
+        r"^(?!.*(ببند|بستن|خروج|کلوز))"
+        r".*(پوزیشن|پوزیشن\u200cها|معامله|معامله\u200cها|پوزیشن\u200cهام)"
+        r".*(چیه|چیست|بگو|نشون|نمایش|دارم|هست|چطور|چطوره|وضعیت)"
+        r"|(پوزیشن|معامله)\s*(هام|هایم|ها)\s*(چیه|چطوره|چطور)", re.I), _b_positions),
+    ("close_position", re.compile(
+        r"(ببند|بستن|کلوز|خروج|بسته)\s*(کن|کنید)?.*"
+        r"(پوزیشن|معامله|پوزیشنمو|پوزیشنمو|همه)"
+        # "پوزیشنم رو ببند" - the verb comes LAST in Persian, so the rule must
+        # also match with the noun first. Without this the most natural way to
+        # say "close my position" fell through to the model.
+        r"|(پوزیشن|معامله|پوزیشنمو|پوزیشنمو|پوزیشنم|معاملم)\s*(رو|را)?\s*(هم)?\s*"
+        r"(ببند|بستن|کلوز|خروج|بسته)", re.I), _b_close_position),
+    ("close_all", re.compile(
+        r"(همه|تمام|کل)\s*(ی|ی\s*)?(پوزیشن|معامله|پوزیشن\u200cها)"
+        r".*(ببند|بستن|کلوز|خروج)", re.I), _b_close_all),
+    ("pnl", re.compile(
+        r"(سود|ضرر|سودم|ضررم|پی\s*ال|پی\u200cال|پروفیت|لاس)"
+        r".*(چقدر|چند|چیه|چیست|بگو|نشون|نمایش|دارم|هست|کردم)"
+        r"|(چقدر|چند)\s*(سود|ضرر)\s*(کردم|دارم|هست)", re.I), _b_pnl_strong),
+    ("status", re.compile(
+        r"(وضعیت|حال|استاتوس|چطوره|چطور\s*است|سالمه)"
+        r".*(ربات|موتور|سیستم|حساب|همه|انجین|ایجنت)?"
+        r"|(ربات|موتور|سیستم|انجین)\s*(روشن|فعال|کار\s*می\u200cکند|خاموش)", re.I),
+     _b_status),
+    ("leverage_read", re.compile(
+        r"(اهرم|لوریج|لوریج\u200cم|اهرمم).*(چقدر|چند|چیه|چیست|بگو|نشون|نمایش)"
+        r"|(چقدر|چند)\s*(اهرم|لوریج)", re.I), _b_leverage_read),
+    ("leverage_set", re.compile(
+        r"(اهرم|لوریج)\s*(رو|را)?\s*(\d+)\s*(برسان|کن|بذار|بزار|تنظیم)"
+        r"|(اهرم|لوریج)\s*(رو|را)?\s*(\d+)", re.I), _b_leverage_set),
+    ("risk_set", re.compile(
+        r"(ریسک)\s*(رو|را)?\s*(\d+(?:\.\d+)?)\s*(درصد|٪|%)?"
+        r"|(ریسک)\s*(رو|را)?\s*(برسان|کن|ببر|بالا|پایین)", re.I), _b_risk_set),
+    ("risk_read", re.compile(
+        r"(ریسک).*(چقدر|چند|چیه|چیست|بگو|نشون|نمایش|بالاست|زیاده)", re.I),
+     _b_risk_read),
+    ("autotrade_off", re.compile(
+        r"(معامله|ربات|اتوترید|ترید)\s*(رو|را)?\s*(متوقف|خاموش|قطع|بس|نگه\s*دار)"
+        r"|(متوقف|خاموش|قطع)\s*(کن)?\s*(معامله|ربات|اتوترید|ترید)", re.I),
+     _b_autotrade_off),
+    ("autotrade_on", re.compile(
+        r"(معامله|ربات|اتوترید|ترید)\s*(رو|را)?\s*(روشن|شروع|فعال|استارت)"
+        r"|(شروع|روشن|فعال)\s*(کن)?\s*(معامله|ربات|اتوترید|ترید)", re.I),
+     _b_autotrade_on),
+    ("smalltalk", re.compile(
+        r"^\s*(سلام|درود|سلام\s*علیکم|چطوری|خوبی|ممنون|مرسی|دستت\s*درد\s*نکنه|"
+        r"صبح\s*بخیر|شب\s*بخیر|هستی\s*\?*)\s*[!.؟?]*\s*$", re.I), _b_smalltalk),
+    ("help", re.compile(
+        r"(چه\s*کار|چیکار|چی\s*می\u200cتونی|کمک|راهنما|چطور\s*می\u200cتونی)"
+        r".*(کنی|بکنی|داری|هستی)?", re.I), _b_help),
 ]
 
 

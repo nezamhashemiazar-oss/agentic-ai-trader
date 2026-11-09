@@ -261,6 +261,70 @@ def test_build_state_is_reusable_without_http(tmp_path):
     _run(go())
 
 
+# ============================================================== margin plan
+def test_margin_plan_shows_the_percentage_as_usdt(tmp_path):
+    """The dashboard must show what MARGIN_AMOUNT_PCT means in money.
+
+    The user's complaint was that the margin on a real position did not match
+    the percentage they set. A bare "10" in a settings box cannot be compared
+    against a position's margin; "10% = 100.05 USDT" can.
+    """
+    async def go():
+        agent = _agent(tmp_path, keys=True)
+        _stub_client(agent, account=[ACCOUNT_ROW])
+        try:
+            agent.engine.state.margin_amount_pct = 10.0
+            agent.engine.state.leverage = 20
+            body = await build_state(agent)
+            mp = body["margin_plan"]
+            assert mp["pct"] == 10.0
+            assert mp["enabled"] is True
+            # sized from AVAILABLE (spendable), not equity
+            assert mp["available"] == pytest.approx(1000.5)
+            assert mp["target_usdt"] == pytest.approx(100.05)
+            # leverage changes the notional, never the margin
+            assert mp["target_notional"] == pytest.approx(100.05 * 20)
+            assert "100.05" in mp["note"]
+        finally:
+            await agent.engine.stop()
+    _run(go())
+
+
+def test_margin_plan_reports_disabled_at_zero(tmp_path):
+    """0 disables the knob, and the dashboard must say so rather than show 0."""
+    async def go():
+        agent = _agent(tmp_path, keys=True)
+        _stub_client(agent, account=[ACCOUNT_ROW])
+        try:
+            agent.engine.state.margin_amount_pct = 0.0
+            mp = (await build_state(agent))["margin_plan"]
+            assert mp["enabled"] is False
+            assert mp["target_usdt"] == 0.0
+            assert "risk_pct" in mp["note"]
+        finally:
+            await agent.engine.stop()
+    _run(go())
+
+
+def test_margin_plan_tracks_the_setting_written_through_the_engine(tmp_path):
+    """Writing the setting must move the derived USDT amount with it.
+
+    This is the anti-drift guard: the dashboard must not compute the plan from
+    its own copy of the value.
+    """
+    async def go():
+        agent = _agent(tmp_path, keys=True)
+        _stub_client(agent, account=[ACCOUNT_ROW])
+        try:
+            await agent.handle("margin amount 25")
+            mp = (await build_state(agent))["margin_plan"]
+            assert mp["pct"] == pytest.approx(25.0)
+            assert mp["target_usdt"] == pytest.approx(1000.5 * 0.25)
+        finally:
+            await agent.engine.stop()
+    _run(go())
+
+
 # ============================================================== autotrade
 def test_autotrade_on_requires_confirmation(tmp_path):
     """Turning autotrade ON places real orders - it must not be a bare POST."""

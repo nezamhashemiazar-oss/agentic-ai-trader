@@ -449,6 +449,45 @@ def max_notional_for_margin(margin_usdt: float, leverage: int,
     return margin_usdt / denom
 
 
+def position_size_by_margin(equity: float, margin_pct: float, entry: float,
+                            leverage: int, rules: PairRules,
+                            fee_rate: float = TAKER_FEE_RATE,
+                            safety_pct: float = 0.0) -> float:
+    """Base-coin qty whose INITIAL MARGIN is ``margin_pct``% of the balance.
+
+    This is the TARGET form of ``MARGIN_AMOUNT_PCT``: the user says "use 10% of
+    my balance as margin on this position", and the size is derived FROM that
+    number rather than merely capped by it.
+
+    ``position_size_by_risk`` treats the same setting as an upper bound, and
+    that is why the configured percentage looked like it did nothing: the
+    risk-based size was almost always the smaller of the two, so the margin
+    actually locked was whatever risk sizing happened to produce (5% when the
+    user asked for 10%, and so on). A cap that never binds is indistinguishable
+    from a setting that is ignored.
+
+        margin_target = equity * pct/100
+        notional      = margin_target / (1/leverage + fee_rate)
+        qty           = notional / entry
+
+    The fee term is kept for the same reason as everywhere else: margin and fee
+    are deducted together, so a notional that spends the whole margin budget on
+    margin alone would be refused with 20003.
+    """
+    if equity <= 0 or entry <= 0 or margin_pct <= 0:
+        return 0.0
+    budget = margin_budget(equity, margin_pct, safety_pct)
+    notional = max_notional_for_margin(budget, leverage, fee_rate)
+    if notional <= 0:
+        return 0.0
+    qty = round_step(notional / entry, rules.base_precision)
+    if qty < rules.min_trade_volume:
+        return 0.0
+    if rules.max_market_order_volume and qty > rules.max_market_order_volume:
+        qty = round_step(rules.max_market_order_volume, rules.base_precision)
+    return qty
+
+
 def position_size_by_risk(equity: float, risk_pct: float, entry: float,
                           stop: float, leverage: int, rules: PairRules,
                           fee_rate: float = TAKER_FEE_RATE,
