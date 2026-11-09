@@ -38,6 +38,7 @@ from .risk import (PairRules, Tier, TpSlSideError, clamp_sl, clamp_tp,
                    margin_required,
                    max_leverage_for_stop, max_notional_for_balance,
                    max_notional_for_margin,
+                   pick_tier,
                    position_size_by_risk,
                    qty_from_notional, qty_from_unit, required_cost, roi_pct,
                    round_price, round_step, spendable_balance,
@@ -1623,7 +1624,8 @@ class TraderEngine:
             rev_conf = agg.confidence if agg else 0.0
             action = mid_management_action(
                 st, roi, reversal and self.state.reversal, rev_conf,
-                self.state.reversal_confidence)
+                self.state.reversal_confidence,
+                self.state.partial_at_roi_pct)
             if action == "close_reversal":
                 res = await self.close_position(symbol=sym, position_id=pid)
                 actions.append({"action": "close_reversal", "symbol": sym,
@@ -1875,6 +1877,7 @@ class TraderEngine:
         if not rest:
             # Bare prefixes that are complete commands on their own.
             return p in ("status", "pnl", "p&l", "settings", "ladder",
+                         "margin amount",
                          "trades_history", "tpsl_history", "trades history",
                          "tpsl history", "symbols", "positions history",
                          "engine on", "engine off", "scan on", "scan off",
@@ -2046,8 +2049,15 @@ class TraderEngine:
             sym = arg("close position").strip() or None
             return json.dumps(await self.close_position(symbol=sym), indent=2)
         if low.startswith("margin amount"):
+            rest = arg("margin amount").strip()
+            if not rest:
+                # Bare "margin amount" is a READ, not a usage error: it is the
+                # natural way to ask what the setting currently is.
+                return (f"Margin per trade = {s.margin_amount_pct:g}% of the "
+                        f"available balance (0 disables the budget).\n"
+                        f"Change it with: margin amount 10")
             try:
-                s.margin_amount_pct = float(arg("margin amount").split()[-1])
+                s.margin_amount_pct = float(rest.split()[-1])
                 return (f"Margin per trade = {s.margin_amount_pct:g}% of the "
                         f"available balance (0 disables the budget).")
             except (ValueError, IndexError):

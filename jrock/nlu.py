@@ -235,7 +235,8 @@ def _b_margin_amount_set(t: str) -> Intent:
     margin, so it is a size knob, not a risk knob. It is destructive because it
     changes how much money the next entry commits.
     """
-    n = _num_after(t, "margin", "amount", "pct", "percent", "to", "at", "use")
+    n = _num_after(t, "margin", "amount", "pct", "percent", "to", "at", "use",
+                   "trade", "risk", "size")
     if n is None:
         return Intent("margin_amount_set", "", 0.5, needs="margin percentage",
                       describe="set the margin amount per trade")
@@ -525,8 +526,13 @@ RULES: list[tuple[str, re.Pattern, object]] = [
     ("margin_amount_set", re.compile(
         r"\b(margin amount|margin pct|margin percent|margin per trade|"
         r"margin percentage)\b.*\b(to|at|=)\s*\d+", re.I), _b_margin_amount_set),
+    # The bare engine form: "margin amount 15" / "margin pct 20". Without this
+    # the sentence fell through to the model even though the engine accepts it.
     ("margin_amount_set", re.compile(
-        r"\b(use|trade with|risk)\b.*\b\d+(?:\.\d+)?\s*%\b.*\b(balance|equity|"
+        r"^\s*(margin amount|margin pct|margin percent|margin per trade|"
+        r"margin percentage)\s+\d+(?:\.\d+)?\s*%?\s*$", re.I), _b_margin_amount_set),
+    ("margin_amount_set", re.compile(
+        r"\b(use|trade with|risk)\b.*\b\d+(?:\.\d+)?\s*%\s*(?:of\b)?.*\b(balance|equity|"
         r"account|per trade|each trade)\b", re.I), _b_margin_amount_set),
     ("margin_amount_read", re.compile(
         r"\b(show|what|whats|what's|display|print|see|check|get|tell|my|how much)\b"

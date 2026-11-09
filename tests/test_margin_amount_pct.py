@@ -311,11 +311,26 @@ def test_runtime_command_sets_it():
     assert "25%" in out
 
 
-def test_runtime_command_rejects_a_missing_number():
+def test_runtime_command_bare_reports_the_setting():
+    """Bare "margin amount" is a READ: it answers with the value, not a usage
+    error. (It used to fall through to the model entirely, because the bare
+    prefix was not recognised as a command.)"""
     e = _engine()
 
     async def go():
         return await e.command("margin amount")
+
+    out = asyncio.run(go())
+    assert "10%" in out
+    assert "Usage" not in out
+    assert e.state.margin_amount_pct == 10.0
+
+
+def test_runtime_command_rejects_a_non_numeric_argument():
+    e = _engine()
+
+    async def go():
+        return await e.command("margin amount abc")
 
     out = asyncio.run(go())
     assert "Usage" in out
