@@ -49,6 +49,58 @@ python -m jrock.web
 Open the printed URL. The page has quick buttons for read-only queries and a box
 for any command or question.
 
+The dashboard is a 1:1 view of the engine, not a subset of it. It refreshes
+itself every 30 seconds (the same default as the engine's own report loop) and
+shows a **last updated** stamp, so a stale page is visible rather than silent.
+
+| Panel | What it shows |
+|---|---|
+| Engine | engine / autotrade / scan / report / mid-management / reversal state, symbols, leverage, scan count, last error |
+| Account | equity, available, margin, unrealized and realized PnL, open position and order counts, API reachability |
+| Open positions | symbol, side, qty, entry, mark, liquidation price, leverage, ROI, unrealized PnL |
+| Open orders | symbol, side, type, qty, price, status |
+| Strategies & permissions | registered strategy count by category, and the agent's permission flags |
+| Readouts | the read/query commands, verbatim: `status`, `settings trade`, bare `margin amount`, `ladder`, `tpsl`, `pnl`, `trades_history`, `tpsl_history` |
+| Settings | every engine setting, editable in place (see below) |
+| Output | the result of the last command or question |
+
+### Dashboard endpoints
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/` | GET | the page (requires `?token=`) |
+| `/api/state` | GET | the structured snapshot the page polls every 30s |
+| `/api/command` | POST | any command or question, through `JRockAgent.handle()` |
+| `/api/autotrade` | POST | the autotrade toggle (needs `confirm: true` to turn ON) |
+| `/api/settings` | POST | write one engine setting |
+| `/api/margin` | POST | `margin add` / `margin reduce` on an isolated position |
+| `/api/toggle` | POST | flip scan / report / reversal / mid-management |
+
+All of them require the `X-Auth-Token` header (or `?token=`).
+
+### Settings you can change from the dashboard
+
+Every setting that used to be reachable only from the CLI or chat is a control
+here. The dashboard does not write engine state directly: it builds the exact
+command the CLI accepts and runs it through `engine.command()`, so validation,
+clamping and persistence are the engine's own.
+
+`margin amount` · `leverage` · `risk` · `max open positions` · `partial close pct`
+· `partial at roi` · `breakeven threshold pct` · `trailing trigger stop ROI pct`
+· `liq sl distance pct` · `min agreeing strategies` · `min confidence`
+· `tf min confidence` · `scans interval sec` · `report interval sec`
+· `reversal_confidence` · `account tp/sl usdt` · `account tp/sl pct`
+· `margin mode` · `position mode` · `tpsl method` · `symbols` · `timeframes`
+· `ladder set` · `ladder breakeven` · `ladder runner` · `ladder basis`
+
+### Autotrade from the dashboard
+
+The autotrade button shows the current state and asks for confirmation before
+turning ON, because that is the switch that lets the engine place real orders.
+Turning it OFF never needs a confirmation. The engine still never resumes
+autotrade automatically after a restart - the dashboard surfaces the
+`autotrade_was_on` warning instead of silently re-arming it.
+
 | Setting | Default | Meaning |
 |---|---|---|
 | `WEB_TOKEN` | *(random per start)* | Dashboard password. Sent as the `X-Auth-Token` header or `?token=` in the URL. Not an API key. |

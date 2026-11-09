@@ -1817,7 +1817,7 @@ class TraderEngine:
         "trailing trigger", "liq sl distance", "min agreeing", "timeframes",
         "min confidence", "tf min confidence", "positions history", "close position",
         "margin mode", "position mode", "symbols", "symbol ", "max open positions",
-        "margin amount",
+        "margin amount", "margin add", "margin reduce",
         "leverage", "risk ",
         # the four documented TP/SL methods
         "tpsl method", "partial close pct", "partial at roi",
@@ -1901,6 +1901,10 @@ class TraderEngine:
                                                 "TRAILING", "ACCOUNT")
         if p == "close position":
             return bool(re.search(r"[A-Za-z]{2,10}USDT", rest, re.I))
+        if p in ("margin add", "margin reduce"):
+            # "margin add BTCUSDT 100" - a symbol AND an amount are required.
+            return bool(re.search(r"[A-Za-z]{2,10}USDT", rest, re.I)
+                        and re.search(r"-?\d+(?:\.\d+)?", rest))
         if p == "ladder":
             return rest.split()[0].lower() in ("set", "off", "none", "disable",
                                                "clear", "breakeven", "runner",
@@ -2048,6 +2052,8 @@ class TraderEngine:
         if low.startswith("close position"):
             sym = arg("close position").strip() or None
             return json.dumps(await self.close_position(symbol=sym), indent=2)
+        if low.startswith("margin add") or low.startswith("margin reduce"):
+            return await self._margin_adjust_command(raw)
         if low.startswith("margin amount"):
             rest = arg("margin amount").strip()
             if not rest:
@@ -2156,6 +2162,62 @@ class TraderEngine:
                 return "Usage: risk 1.0"
 
         return f"Unknown engine command: {raw!r}. Type 'help' for the list."
+
+    async def _margin_adjust_command(self, raw: str) -> str:
+        """`margin add SYMBOL AMOUNT` / `margin reduce SYMBOL AMOUNT`.
+
+        Documented in HELP and implemented in the client
+        (`adjust_position_margin`) but never wired into the router, so the
+        documented command answered "Unknown engine command". Isolated margin
+        only: the endpoint is meaningless for a CROSS position, and the
+        exchange rejects it, so it is refused locally with a clear reason
+        instead of a raw API error.
+
+        The position is looked up first so the call carries the real
+        `positionId` (and side) rather than guessing - the endpoint requires
+        one of them.
+        """
+        low = raw.strip().lower()
+        reduce_ = low.startswith("margin reduce")
+        rest = raw.strip()[len("margin reduce" if reduce_ else "margin add"):].strip()
+        parts = rest.replace(",", " ").split()
+        sym = next((p.upper() for p in parts if re.fullmatch(r"[A-Za-z]{2,10}USDT", p)), "")
+        amount = next((p for p in parts if re.fullmatch(r"-?\d+(?:\.\d+)?", p)), "")
+        if not sym or not amount:
+            return ("Usage: margin add BTCUSDT 100 | margin reduce BTCUSDT 50\n"
+                    "(isolated margin only; the amount is in USDT)")
+        try:
+            amt = abs(float(amount))
+        except ValueError:
+            return "Usage: margin add BTCUSDT 100 | margin reduce BTCUSDT 50"
+        if amt <= 0:
+            return "The amount must be greater than 0."
+
+        if (self.state.margin_mode or "").upper() != "ISOLATION":
+            return (f"Margin can only be adjusted on an ISOLATED position; "
+                    f"margin mode is {self.state.margin_mode}. "
+                    f"Set it with: margin mode ISOLATION")
+
+        positions = await self.open_positions()
+        pos = next((p for p in positions
+                    if str(p.get("symbol", "")).upper() == sym), None)
+        if pos is None:
+            return f"No open {sym} position to adjust margin on."
+
+        pid = str(pos.get("positionId") or "")
+        side = str(pos.get("side") or "").upper() or None
+        signed = -amt if reduce_ else amt
+        try:
+            await self.client.adjust_position_margin(
+                symbol=sym, amount=str(signed), position_id=pid or None, side=side)
+        except BitunixAPIError as e:
+            self.state.errors.append(f"margin adjust {sym}: {e}")
+            return f"Bitunix error {e.code}: {e.msg or e}"
+        except ValueError as e:
+            return f"Cannot adjust margin: {e}"
+        verb = "Reduced" if reduce_ else "Added"
+        return (f"{verb} {amt:g} USDT {'from' if reduce_ else 'to'} the {sym} "
+                f"{side or ''} position (isolated margin).").replace("  ", " ")
 
     def _ladder_command(self, raw: str) -> str:
         """`ladder ...` - show, set, disable, and the two sub-settings.
